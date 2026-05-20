@@ -301,6 +301,44 @@ class TestCheckWebApiKey:
 class TestSearXNGOnlyExtractCrawlErrors:
     """When searxng is the active backend, extract/crawl must return clear errors."""
 
+    @staticmethod
+    def _register_providers():
+        """Populate the web-search registry with every bundled provider.
+
+        Under xdist, other test files' import side-effects register
+        providers, but when this file runs in isolation the
+        registry is empty and the "search-only" error path is never
+        reached (falls through to "no available backend" instead).
+        """
+        from agent.web_search_registry import register_provider
+        from plugins.web.brave_free.provider import BraveFreeWebSearchProvider
+        from plugins.web.ddgs.provider import DDGSWebSearchProvider
+        from plugins.web.exa.provider import ExaWebSearchProvider
+        from plugins.web.firecrawl.provider import FirecrawlWebSearchProvider
+        from plugins.web.parallel.provider import ParallelWebSearchProvider
+        from plugins.web.searxng.provider import SearXNGWebSearchProvider
+        from plugins.web.tavily.provider import TavilyWebSearchProvider
+        from plugins.web.xai.provider import XAIWebSearchProvider
+
+        for cls in (
+            BraveFreeWebSearchProvider,
+            DDGSWebSearchProvider,
+            ExaWebSearchProvider,
+            FirecrawlWebSearchProvider,
+            ParallelWebSearchProvider,
+            SearXNGWebSearchProvider,
+            TavilyWebSearchProvider,
+            XAIWebSearchProvider,
+        ):
+            register_provider(cls())
+
+    @pytest.fixture(autouse=True)
+    def _populate_web_registry(self):
+        self._register_providers()
+        yield
+        from agent.web_search_registry import _reset_for_tests
+        _reset_for_tests()
+
     def test_web_crawl_searxng_returns_clear_error(self, monkeypatch):
         import asyncio
         from tools import web_tools
@@ -309,6 +347,8 @@ class TestSearXNGOnlyExtractCrawlErrors:
         monkeypatch.setenv("SEARXNG_URL", "http://localhost:8080")
         monkeypatch.setattr(web_tools, "_is_tool_gateway_ready", lambda: False)
         monkeypatch.setattr(web_tools, "check_firecrawl_api_key", lambda: False)
+        monkeypatch.setattr(web_tools, "is_safe_url", lambda url: True)
+        monkeypatch.setattr(web_tools, "check_website_access", lambda url: None)
         monkeypatch.setattr("tools.interrupt.is_interrupted", lambda: False, raising=False)
 
         import json
@@ -326,6 +366,7 @@ class TestSearXNGOnlyExtractCrawlErrors:
         monkeypatch.setattr(web_tools, "_load_web_config", lambda: {"backend": "searxng"})
         monkeypatch.setenv("SEARXNG_URL", "http://localhost:8080")
         monkeypatch.setattr(web_tools, "_is_tool_gateway_ready", lambda: False)
+        monkeypatch.setattr(web_tools, "is_safe_url", lambda url: True)
         monkeypatch.setattr("tools.interrupt.is_interrupted", lambda: False, raising=False)
 
         import json

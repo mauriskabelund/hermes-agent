@@ -1047,6 +1047,20 @@ class TestGetProviderChain:
 class TestTryPaymentFallback:
     """_try_payment_fallback skips the failed provider and tries alternatives."""
 
+    @pytest.fixture(autouse=True)
+    def _clear_unhealthy_cache(self):
+        """Earlier tests in this file call _mark_provider_unhealthy() which
+        pollutes the module-level ``_aux_unhealthy_until`` dict (10-min TTL).
+        Without this cleanup the fallback chain skips providers we've patched
+        to return valid clients — the patched function is never called.
+        """
+        from agent.auxiliary_client import _aux_unhealthy_until, _aux_unhealthy_logged_at
+        _aux_unhealthy_until.clear()
+        _aux_unhealthy_logged_at.clear()
+        yield
+        _aux_unhealthy_until.clear()
+        _aux_unhealthy_logged_at.clear()
+
     def test_skips_failed_provider(self):
         mock_client = MagicMock()
         with patch("agent.auxiliary_client._try_openrouter", return_value=(None, None)), \

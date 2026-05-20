@@ -276,6 +276,30 @@ class TestUnconfiguredErrorEnvelopeParity:
     ``result.get("error")`` detect the failure cleanly.
     """
 
+    @staticmethod
+    def _register_providers():
+        from agent.web_search_registry import register_provider, _reset_for_tests
+        from plugins.web.brave_free.provider import BraveFreeWebSearchProvider
+        from plugins.web.ddgs.provider import DDGSWebSearchProvider
+        from plugins.web.exa.provider import ExaWebSearchProvider
+        from plugins.web.firecrawl.provider import FirecrawlWebSearchProvider
+        from plugins.web.parallel.provider import ParallelWebSearchProvider
+        from plugins.web.searxng.provider import SearXNGWebSearchProvider
+        from plugins.web.tavily.provider import TavilyWebSearchProvider
+        from plugins.web.xai.provider import XAIWebSearchProvider
+        _reset_for_tests()
+        for cls in (BraveFreeWebSearchProvider, DDGSWebSearchProvider, ExaWebSearchProvider,
+                    FirecrawlWebSearchProvider, ParallelWebSearchProvider, SearXNGWebSearchProvider,
+                    TavilyWebSearchProvider, XAIWebSearchProvider):
+            register_provider(cls())
+
+    @pytest.fixture(autouse=True)
+    def _populate_web_registry(self):
+        self._register_providers()
+        yield
+        from agent.web_search_registry import _reset_for_tests
+        _reset_for_tests()
+
     def _clear_web_creds(self, monkeypatch):
         for k in (
             "BRAVE_SEARCH_API_KEY",
