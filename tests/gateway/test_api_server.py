@@ -721,6 +721,12 @@ class TestToolsetsEndpoint:
 
 
 class TestChatCompletionsEndpoint:
+    def test_sse_keepalive_matches_whatwg_proxy_guidance(self):
+        """Quiet streams should emit a comment at least every ~15 seconds."""
+        from gateway.platforms.api_server import CHAT_COMPLETIONS_SSE_KEEPALIVE_SECONDS
+
+        assert 0 < CHAT_COMPLETIONS_SSE_KEEPALIVE_SECONDS <= 15.0
+
     @pytest.mark.asyncio
     async def test_invalid_json_returns_400(self, adapter):
         app = _create_app(adapter)

@@ -124,7 +124,10 @@ DEFAULT_HOST = "127.0.0.1"
 DEFAULT_PORT = 8642
 MAX_STORED_RESPONSES = 100
 MAX_REQUEST_BYTES = 10_000_000  # 10 MB — accommodates long agent conversations with tool calls
-CHAT_COMPLETIONS_SSE_KEEPALIVE_SECONDS = 30.0
+# WHATWG recommends comment lines roughly every 15 seconds to keep legacy
+# proxies from timing out an otherwise healthy event stream. SSE clients
+# ignore comments, so this never fabricates model output or progress.
+CHAT_COMPLETIONS_SSE_KEEPALIVE_SECONDS = 15.0
 MAX_NORMALIZED_TEXT_LENGTH = 65_536  # 64 KB cap for normalized content parts
 MAX_CONTENT_LIST_SIZE = 1_000  # Max items when content is an array
 RESPONSES_AUTO_TRUNCATION_HISTORY_LIMIT = 100

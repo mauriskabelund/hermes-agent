@@ -1834,9 +1834,15 @@ class MatrixAdapter(BasePlatformAdapter):
                             chat_id,
                             retry_exc,
                         )
-                        return SendResult(success=False, error=str(retry_exc))
+                        return self._rate_limit_result(retry_exc) or SendResult(
+                            success=False,
+                            error=str(retry_exc),
+                        )
                 logger.error("Matrix: failed to send to %s: %s", chat_id, exc)
-                return SendResult(success=False, error=str(exc))
+                return self._rate_limit_result(exc) or SendResult(
+                    success=False,
+                    error=str(exc),
+                )
 
         return SendResult(success=True, message_id=last_event_id)
 
@@ -1915,6 +1921,28 @@ class MatrixAdapter(BasePlatformAdapter):
             except Exception:
                 pass
 
+    @staticmethod
+    def _rate_limit_result(exc: Exception) -> Optional[SendResult]:
+        """Translate Matrix flood control into structured retry metadata.
+
+        mautrix 0.21 discards the homeserver's ``retry_after_ms`` field when it
+        constructs MLimitExceeded, so use a conservative cooldown rather than
+        immediately hammering the same endpoint again.
+        """
+        detail = str(exc).lower()
+        if (
+            getattr(exc, "http_status", None) != 429
+            and "too many requests" not in detail
+            and "m_limit_exceeded" not in detail
+        ):
+            return None
+        return SendResult(
+            success=False,
+            error=str(exc) or "Matrix rate limit exceeded",
+            retryable=True,
+            retry_after=10.0,
+            error_kind="rate_limit",
+        )
 
     async def edit_message(
         self, chat_id: str, message_id: str, content: str, *, finalize: bool = False
@@ -1946,7 +1974,10 @@ class MatrixAdapter(BasePlatformAdapter):
             )
             return SendResult(success=True, message_id=str(event_id))
         except Exception as exc:
-            return SendResult(success=False, error=str(exc))
+            return self._rate_limit_result(exc) or SendResult(
+                success=False,
+                error=str(exc),
+            )
 
     async def send_image(
         self,

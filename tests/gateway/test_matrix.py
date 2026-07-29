@@ -342,6 +342,29 @@ class TestMatrixTypingIndicator:
             timeout=0,
         )
 
+    @pytest.mark.asyncio
+    async def test_stop_typing_no_client_is_noop(self):
+        self.adapter._client = None
+        await self.adapter.stop_typing("!room:example.org")  # should not raise
+
+    @pytest.mark.asyncio
+    async def test_stop_typing_suppresses_exceptions(self):
+        self.adapter._client.set_typing = AsyncMock(side_effect=Exception("network"))
+        await self.adapter.stop_typing("!room:example.org")  # should not raise
+
+    def test_rate_limit_is_retryable_with_conservative_cooldown(self):
+        class RateLimitError(RuntimeError):
+            http_status = 429
+
+        result = self.adapter._rate_limit_result(RateLimitError("Too Many Requests"))
+
+        assert result is not None
+        assert result.retryable is True
+        assert result.retry_after >= 10.0
+
+    def test_non_rate_limit_is_not_reclassified(self):
+        assert self.adapter._rate_limit_result(RuntimeError("forbidden")) is None
+
 
 # ---------------------------------------------------------------------------
 # mxc:// URL conversion
