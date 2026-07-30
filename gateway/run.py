@@ -25,6 +25,7 @@ except ModuleNotFoundError:
     pass
 
 import asyncio
+import codecs
 import concurrent.futures
 import dataclasses
 import faulthandler
@@ -76,6 +77,194 @@ _PLATFORM_CONNECT_TIMEOUT_SECS_DEFAULT = 30.0
 _TELEGRAM_CONNECT_TIMEOUT_SECS_DEFAULT = 180.0
 _ADAPTER_DISCONNECT_TIMEOUT_SECS_DEFAULT = 5.0
 _GATEWAY_PROXY_SSE_BUFFER_MAX_CHARS = 16 * 1024 * 1024
+
+
+class _SSEFrameDecoder:
+    """Incrementally decode bounded SSE frames across arbitrary byte chunks."""
+
+    def __init__(self) -> None:
+        self._buffer = ""
+        self._event = ""
+        self._data_lines: List[str] = []
+        self._event_bytes = 0
+        self._utf8_decoder = codecs.getincrementaldecoder("utf-8")("strict")
+
+    def _dispatch(self) -> Optional[tuple[str, str]]:
+        if not self._data_lines:
+            self._event = ""
+            self._event_bytes = 0
+            return None
+        frame = (self._event or "message", "\n".join(self._data_lines))
+        self._event = ""
+        self._data_lines = []
+        self._event_bytes = 0
+        return frame
+
+    def _consume_line(self, line: str) -> Optional[tuple[str, str]]:
+        if not line:
+            return self._dispatch()
+        self._event_bytes += len(line.encode("utf-8")) + 1
+        if self._event_bytes > _GATEWAY_PROXY_SSE_BUFFER_MAX_CHARS:
+            raise ValueError("Proxy SSE event exceeded max buffer size")
+        if line.startswith(":"):
+            return None
+        field, separator, value = line.partition(":")
+        if separator and value.startswith(" "):
+            value = value[1:]
+        if field == "event":
+            self._event = value
+        elif field == "data":
+            self._data_lines.append(value)
+        return None
+
+    def _feed_text(self, text: str, *, final: bool = False) -> List[tuple[str, str]]:
+        self._buffer += text
+        frames: List[tuple[str, str]] = []
+        while self._buffer:
+            lf = self._buffer.find("\n")
+            cr = self._buffer.find("\r")
+            indexes = [index for index in (lf, cr) if index >= 0]
+            if not indexes:
+                break
+            boundary = min(indexes)
+            if (
+                not final
+                and self._buffer[boundary] == "\r"
+                and boundary + 1 == len(self._buffer)
+            ):
+                break
+            line = self._buffer[:boundary]
+            consumed = 2 if self._buffer.startswith("\r\n", boundary) else 1
+            self._buffer = self._buffer[boundary + consumed :]
+            frame = self._consume_line(line)
+            if frame is not None:
+                frames.append(frame)
+        buffered_bytes = self._event_bytes + len(self._buffer.encode("utf-8"))
+        if buffered_bytes > _GATEWAY_PROXY_SSE_BUFFER_MAX_CHARS:
+            raise ValueError("Proxy SSE event exceeded max buffer size")
+        return frames
+
+    def feed(self, chunk: Union[bytes, str]) -> List[tuple[str, str]]:
+        text = (
+            self._utf8_decoder.decode(chunk, final=False)
+            if isinstance(chunk, bytes)
+            else chunk
+        )
+        return self._feed_text(text)
+
+    def finish(self) -> List[tuple[str, str]]:
+        frames = self._feed_text(
+            self._utf8_decoder.decode(b"", final=True), final=True
+        )
+        if self._buffer:
+            frame = self._consume_line(self._buffer)
+            self._buffer = ""
+            if frame is not None:
+                frames.append(frame)
+        frame = self._dispatch()
+        if frame is not None:
+            frames.append(frame)
+        return frames
+
+
+def _truncate_utf8(value: Any, max_bytes: int) -> str:
+    text = str(value or "").strip()
+    encoded = text.encode("utf-8")
+    if len(encoded) <= max_bytes:
+        return text
+    return encoded[:max_bytes].decode("utf-8", errors="ignore").rstrip()
+
+
+async def _deliver_replaceable_progress(
+    adapter: Any,
+    chat_id: str,
+    message_id: Optional[str],
+    content: str,
+    metadata: Optional[Dict[str, Any]],
+) -> tuple[Any, Optional[str]]:
+    """Edit one progress message, preserving retry metadata on rate limits."""
+    if message_id:
+        try:
+            edited = await adapter.edit_message(
+                chat_id,
+                message_id,
+                content,
+                metadata=metadata,
+            )
+            if edited.success or getattr(edited, "retryable", False):
+                return edited, message_id
+        except Exception:
+            logger.debug("Proxy: Matrix tool-progress edit failed", exc_info=True)
+    sent = await adapter.send(chat_id, content, metadata=metadata)
+    if sent.success and sent.message_id:
+        message_id = str(sent.message_id)
+    return sent, message_id
+
+
+async def _finalize_proxy_deliveries(
+    stream_consumer: Any,
+    stream_task: Optional[asyncio.Task],
+    progress_delivery: Any,
+) -> None:
+    """Finalize answer delivery first; progress cleanup is bounded best effort."""
+    cancellation: Optional[asyncio.CancelledError] = None
+    if stream_consumer:
+        stream_consumer.finish()
+    try:
+        if stream_task:
+            await asyncio.wait_for(asyncio.shield(stream_task), timeout=5.0)
+    except asyncio.TimeoutError:
+        if stream_task:
+            stream_task.cancel()
+    except asyncio.CancelledError as exc:
+        current = asyncio.current_task()
+        if current is not None and current.cancelling():
+            cancellation = exc
+        if stream_task:
+            stream_task.cancel()
+    finally:
+        if stream_task and not stream_task.done():
+            stream_task.cancel()
+        if stream_task:
+            try:
+                await stream_task
+            except asyncio.CancelledError:
+                pass
+            except Exception:
+                logger.warning("Proxy answer stream finalization failed", exc_info=True)
+
+        if progress_delivery is not None:
+            cleanup_task = asyncio.create_task(progress_delivery.close())
+            try:
+                await asyncio.wait_for(asyncio.shield(cleanup_task), timeout=5.0)
+            except asyncio.CancelledError as exc:
+                current = asyncio.current_task()
+                if current is not None and current.cancelling():
+                    cancellation = cancellation or exc
+                    try:
+                        await asyncio.wait_for(
+                            asyncio.shield(cleanup_task), timeout=5.0
+                        )
+                    except Exception:
+                        logger.warning(
+                            "Proxy tool-progress cleanup failed", exc_info=True
+                        )
+            except Exception:
+                logger.warning("Proxy tool-progress cleanup failed", exc_info=True)
+            finally:
+                if not cleanup_task.done():
+                    cleanup_task.cancel()
+                try:
+                    await cleanup_task
+                except asyncio.CancelledError:
+                    pass
+                except Exception:
+                    pass
+
+    if cancellation is not None:
+        raise cancellation
+
+
 _TELEGRAM_COMMAND_MENTION_RE = re.compile(r"(?<![\w:/])/([A-Za-z0-9][A-Za-z0-9_-]*)")
 _GATEWAY_HYGIENE_PLATFORM = "gateway_hygiene"
 
@@ -22652,13 +22841,16 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         if not _adapter_supports_edit and on_missing_cursor == "raise":
             raise RuntimeError("skip streaming for non-editable platform")
         _effective_cursor = scfg.cursor if _adapter_supports_edit else ""
-        # Some Matrix clients render the streaming cursor
-        # as a visible tofu/white-box artifact.  Keep
-        # streaming text on Matrix, but suppress the cursor.
+        # Some Matrix clients render the streaming cursor as a visible
+        # tofu/white-box artifact. Keep it hidden. Matrix remains buffer-only
+        # by default to avoid flooding homeservers, but deployments that have
+        # tuned edit cadence can explicitly opt into progressive m.replace.
         _buffer_only = False
         if source.platform == Platform.MATRIX:
             _effective_cursor = ""
-            _buffer_only = True
+            _buffer_only = not bool(
+                getattr(scfg, "matrix_progressive", False)
+            )
         # Fresh-final applies to Telegram only — other
         # platforms either edit in place cheaply (Discord,
         # Slack) or don't have the timestamp-on-edit /
@@ -22729,6 +22921,27 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 return True
             return self._is_session_run_current(session_key, run_generation)
 
+        # Startup auto-resume normally replaces its empty synthetic message
+        # with a recovery note before proxy dispatch. Fail closed here too so
+        # an internal race cannot create an empty remote turn.
+        if isinstance(message, str) and not message.strip():
+            logger.warning(
+                "Proxy: suppressed empty internal continuation for %s",
+                session_key or source.chat_id,
+            )
+            return {
+                "final_response": "",
+                "messages": [],
+                "api_calls": 0,
+                "tools": [],
+                "history_offset": len(history),
+                "session_id": session_id,
+                "interrupted": True,
+                "completed": False,
+                "response_previewed": True,
+                "already_sent": True,
+            }
+
         # Build messages in OpenAI chat format --------------------------
         #
         # The remote api_server can maintain session continuity via
@@ -22759,12 +22972,43 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             headers["Authorization"] = f"Bearer {proxy_key}"
         if session_id:
             headers["X-Hermes-Session-Id"] = session_id
+        if session_key:
+            headers["X-Hermes-Session-Key"] = session_key
+
+        proxy_model = "hermes-agent"
+        proxy_provider: Optional[str] = None
+        try:
+            channel_override = _get_channel_override(
+                self.config,
+                source.platform,
+                str(source.chat_id),
+                thread_id=(str(source.thread_id) if source.thread_id else None),
+                parent_id=(
+                    str(source.parent_chat_id)
+                    if getattr(source, "parent_chat_id", None)
+                    else None
+                ),
+            )
+            if channel_override:
+                override_model = getattr(channel_override, "model", None)
+                override_provider = getattr(channel_override, "provider", None)
+                if override_model:
+                    proxy_model = override_model
+                if override_provider:
+                    proxy_provider = override_provider
+        except Exception:
+            logger.debug(
+                "Proxy: could not resolve channel model override",
+                exc_info=True,
+            )
 
         body = {
-            "model": "hermes-agent",
+            "model": proxy_model,
             "messages": api_messages,
             "stream": True,
         }
+        if proxy_provider:
+            body["provider"] = proxy_provider
 
         # Set up platform streaming if available -------------------------
         _stream_consumer = None
@@ -22786,6 +23030,63 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         )
 
         _thread_metadata: Optional[Dict[str, Any]] = self._thread_metadata_for_source(source, event_message_id)
+
+        # The remote API emits structured tool lifecycle events beside text
+        # deltas. Surface running tools in Matrix as one replaceable status
+        # message. Coalescing is mandatory here: tool-heavy turns can emit
+        # bursts that otherwise trip Synapse's rate limits and starve the
+        # actual answer stream.
+        _proxy_tool_mode = resolve_display_setting(
+            user_config, platform_key, "tool_progress", "new"
+        )
+        _proxy_progress_message_id: Optional[str] = None
+        _proxy_progress_lines: List[str] = []
+        _proxy_last_tool: Optional[str] = None
+        _proxy_progress_delivery = None
+
+        async def _deliver_proxy_progress(content: str) -> Any:
+            nonlocal _proxy_progress_message_id
+            adapter: Any = self._adapter_for_source(source)
+            if adapter is None:
+                return None
+            result, _proxy_progress_message_id = await _deliver_replaceable_progress(
+                adapter,
+                source.chat_id,
+                _proxy_progress_message_id,
+                content,
+                _thread_metadata,
+            )
+            return result
+
+        if source.platform == Platform.MATRIX and _proxy_tool_mode != "off":
+            from gateway.progress_delivery import CoalescedProgressDelivery
+            _proxy_progress_delivery = CoalescedProgressDelivery(
+                _deliver_proxy_progress,
+                min_interval=max(2.5, float(_scfg.edit_interval or 0.0)),
+                default_retry_after=10.0,
+            )
+
+        async def _emit_proxy_tool_progress(payload: Dict[str, Any]) -> None:
+            nonlocal _proxy_last_tool
+            if _proxy_progress_delivery is None:
+                return
+            if payload.get("status") != "running":
+                return
+            tool_name = _truncate_utf8(payload.get("tool") or "tool", 128)
+            if _proxy_tool_mode == "new" and tool_name == _proxy_last_tool:
+                return
+            _proxy_last_tool = tool_name
+            label = _truncate_utf8(payload.get("label") or tool_name, 240)
+            emoji = _truncate_utf8(payload.get("emoji") or "⚙️", 16)
+            line = f"{emoji} {label}".strip()
+            if not line:
+                return
+            _proxy_progress_lines.append(line)
+            del _proxy_progress_lines[:-12]
+            await _proxy_progress_delivery.push("\n".join(_proxy_progress_lines))
+            # Give the detached delivery task one scheduling turn. Platform I/O
+            # remains isolated there and can never block SSE answer consumption.
+            await asyncio.sleep(0)
 
         if _streaming_enabled:
             try:
@@ -22826,6 +23127,29 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         # Make the HTTP request with SSE streaming -----------------------
         full_response = ""
         _start = time.time()
+        _sse_decoder = _SSEFrameDecoder()
+
+        async def _consume_proxy_sse_frame(event_name: str, data: str) -> bool:
+            nonlocal full_response
+            if data.strip() == "[DONE]":
+                return True
+            try:
+                obj = json.loads(data)
+            except json.JSONDecodeError:
+                logger.debug("Proxy: discarded malformed SSE JSON frame")
+                return False
+            if event_name == "hermes.tool.progress":
+                await _emit_proxy_tool_progress(obj)
+                return False
+            choices = obj.get("choices", [])
+            if choices:
+                delta = choices[0].get("delta", {})
+                content = delta.get("content", "")
+                if content:
+                    full_response += content
+                    if _stream_consumer:
+                        _stream_consumer.on_delta(content)
+            return False
 
         try:
             _timeout = ClientTimeout(total=0, sock_read=1800)
@@ -22848,8 +23172,8 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                             "tools": [],
                         }
 
-                    # Parse SSE stream
-                    buffer = ""
+                    # Parse complete SSE frames across arbitrary chunks.
+                    sse_done = False
                     async for chunk in resp.content.iter_any():
                         if not _run_still_current():
                             logger.info(
@@ -22866,35 +23190,16 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                                 "session_id": session_id,
                                 "response_previewed": False,
                             }
-                        text = chunk.decode("utf-8", errors="replace")
-                        buffer += text
-
-                        # Process complete SSE lines
-                        while "\n" in buffer:
-                            line, buffer = buffer.split("\n", 1)
-                            line = line.strip()
-                            if not line:
-                                continue
-                            if line.startswith("data: "):
-                                data = line[6:]
-                                if data.strip() == "[DONE]":
-                                    break
-                                try:
-                                    obj = json.loads(data)
-                                    choices = obj.get("choices", [])
-                                    if choices:
-                                        delta = choices[0].get("delta", {})
-                                        content = delta.get("content", "")
-                                        if content:
-                                            full_response += content
-                                            if _stream_consumer:
-                                                _stream_consumer.on_delta(content)
-                                except json.JSONDecodeError:
-                                    pass
-                        if len(buffer) > _GATEWAY_PROXY_SSE_BUFFER_MAX_CHARS:
-                            raise ValueError(
-                                "Proxy SSE stream exceeded max buffer size without a line boundary"
-                            )
+                        for event_name, data in _sse_decoder.feed(chunk):
+                            if await _consume_proxy_sse_frame(event_name, data):
+                                sse_done = True
+                                break
+                        if sse_done:
+                            break
+                    if not sse_done:
+                        for event_name, data in _sse_decoder.finish():
+                            if await _consume_proxy_sse_frame(event_name, data):
+                                break
 
         except asyncio.CancelledError:
             raise
@@ -22909,14 +23214,11 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 }
             # Partial response — return what we got
         finally:
-            # Finalize stream consumer
-            if _stream_consumer:
-                _stream_consumer.finish()
-            if stream_task:
-                try:
-                    await asyncio.wait_for(stream_task, timeout=5.0)
-                except (asyncio.TimeoutError, asyncio.CancelledError):
-                    stream_task.cancel()
+            await _finalize_proxy_deliveries(
+                _stream_consumer,
+                stream_task,
+                _proxy_progress_delivery,
+            )
 
         _elapsed = time.time() - _start
         if not _run_still_current():
@@ -22939,6 +23241,16 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             proxy_url, (session_id or "")[:20], _elapsed, len(full_response),
         )
 
+        _proxy_delivery_confirmed = bool(
+            _stream_consumer
+            and full_response
+            and (
+                _stream_consumer.final_response_sent
+                or _stream_consumer.final_content_delivered
+                or _stream_consumer.has_delivered_text(full_response)
+            )
+        )
+
         return {
             "final_response": full_response or "(No response from remote agent)",
             "messages": [
@@ -22949,7 +23261,8 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             "tools": [],
             "history_offset": len(history),
             "session_id": session_id,
-            "response_previewed": _stream_consumer is not None and bool(full_response),
+            "response_previewed": _proxy_delivery_confirmed,
+            "already_sent": _proxy_delivery_confirmed,
         }
 
     # ------------------------------------------------------------------

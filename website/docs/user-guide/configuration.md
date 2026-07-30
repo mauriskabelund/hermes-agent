@@ -1792,7 +1792,7 @@ display:
 
 When enabled, responses appear token-by-token inside a streaming box. Tool calls are still captured silently. If the provider doesn't support streaming, it falls back to the normal display automatically.
 
-### Gateway Streaming (Telegram, Discord, Slack)
+### Gateway Streaming (Telegram, Discord, Slack, Matrix)
 
 ```yaml
 streaming:
@@ -1801,10 +1801,13 @@ streaming:
   edit_interval: 0.8      # Seconds between message edits (default: 0.8)
   buffer_threshold: 24    # Characters before forcing an edit flush (default: 24)
   cursor: " ▉"            # Cursor shown during streaming
+  matrix_progressive: false  # Opt into recurring Matrix m.replace edits
   fresh_final_after_seconds: 0    # Opt in to fresh final (Telegram) when preview is this old
 ```
 
 When enabled, the bot sends a message on the first token, then progressively edits it as more tokens arrive. Platforms that don't support message editing (Signal, Email, Home Assistant) are auto-detected on the first attempt — streaming is gracefully disabled for that session with no flood of messages.
+
+**Matrix:** Matrix stays buffer-only at structural boundaries by default. Set `matrix_progressive: true` to opt into recurring `m.replace` edits in clients such as Element X. The Matrix cursor is always hidden to avoid the visible tofu/white-box artifact seen in some clients. Use a conservative `edit_interval` to stay within homeserver rate limits.
 
 For separate natural mid-turn assistant updates without progressive token editing, set `display.interim_assistant_messages: true`.
 

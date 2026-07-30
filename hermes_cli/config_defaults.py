@@ -2521,6 +2521,10 @@ DEFAULT_CONFIG = {
         "buffer_threshold": 24,
         # Cursor glyph appended to the in-progress message while streaming.
         "cursor": " \u2589",
+        # Matrix m.replace updates are buffer-only by default because some
+        # clients flicker and homeservers may rate-limit frequent edits. Set
+        # true to opt in after tuning edit_interval for the deployment.
+        "matrix_progressive": False,
         # When >0, the final edit for a long-running streamed response is
         # delivered as a fresh message if the preview has been visible at
         # least this many seconds, so the platform timestamp reflects

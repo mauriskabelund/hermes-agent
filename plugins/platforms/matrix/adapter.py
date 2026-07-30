@@ -54,6 +54,7 @@ from __future__ import annotations
 import asyncio
 import array
 import inspect
+import json
 import logging
 import mimetypes
 import os
@@ -1010,6 +1011,15 @@ class MatrixAdapter(BasePlatformAdapter):
         self._client: Any = None  # mautrix.client.Client
         self._crypto_db: Any = None  # mautrix.util.async_db.Database
         self._sync_task: Optional[asyncio.Task] = None
+        # Matrix typing is room-scoped while runs may be thread-scoped. Track
+        # refresh ownership so one thread cannot clear another, and coalesce
+        # concurrent network updates so typing itself cannot trigger 429s.
+        self._typing_tasks_by_room_and_thread: Dict[
+            str, Dict[str, Set[asyncio.Task]]
+        ] = {}
+        self._typing_active_rooms: Set[str] = set()
+        self._typing_last_sent_at: Dict[str, float] = {}
+        self._typing_send_locks: Dict[str, asyncio.Lock] = {}
         self._invite_join_tasks: Dict[str, asyncio.Task] = {}
         self._closing = False
         self._startup_ts: float = 0.0
@@ -1025,6 +1035,10 @@ class MatrixAdapter(BasePlatformAdapter):
         self._late_grace_skew: float = 0.0
         self._clock_skew_warned: bool = False
         self._last_sync_ts: float = 0.0
+        readiness_file = os.getenv("MATRIX_READINESS_FILE", "").strip()
+        self._readiness_file = (
+            Path(readiness_file).expanduser() if readiness_file else None
+        )
 
         # Cache: room_id → bool (is DM)
         self._dm_rooms: Dict[str, bool] = {}
@@ -1351,9 +1365,39 @@ class MatrixAdapter(BasePlatformAdapter):
     # Required overrides
     # ------------------------------------------------------------------
 
+    def _clear_readiness(self) -> None:
+        if self._readiness_file is None:
+            return
+        try:
+            self._readiness_file.unlink()
+        except FileNotFoundError:
+            pass
+
+    def _write_readiness(self) -> None:
+        if self._readiness_file is None:
+            return
+        self._readiness_file.parent.mkdir(parents=True, exist_ok=True)
+        temporary = self._readiness_file.with_suffix(
+            self._readiness_file.suffix + f".{os.getpid()}.tmp"
+        )
+        temporary.write_text(
+            json.dumps(
+                {
+                    "pid": os.getpid(),
+                    "synced_at": time.time(),
+                    "user_id": self._user_id,
+                },
+                sort_keys=True,
+            ),
+            encoding="utf-8",
+        )
+        temporary.chmod(0o600)
+        os.replace(temporary, self._readiness_file)
+
     async def connect(self, *, is_reconnect: bool = False) -> bool:
         """Connect to the Matrix homeserver and start syncing."""
         self._device_id_unverified = False
+        self._clear_readiness()
         if self._client is not None:
             try:
                 await self.disconnect()
@@ -1685,9 +1729,10 @@ class MatrixAdapter(BasePlatformAdapter):
         self._clock_skew_warned = False
         self._closing = False
 
+        initial_sync_ready = False
         try:
             sync_data = await client.sync(timeout=10000, full_state=True)
-            if isinstance(sync_data, dict):
+            if isinstance(sync_data, dict) and sync_data.get("next_batch"):
                 self._last_sync_ts = time.time()
                 rooms_join = sync_data.get("rooms", {}).get("join", {})
                 self._joined_rooms.clear()
@@ -1713,6 +1758,7 @@ class MatrixAdapter(BasePlatformAdapter):
                 except Exception as exc:
                     logger.warning("Matrix: initial sync event dispatch error: %s", exc)
                 self._schedule_pending_invite_joins(sync_data)
+                initial_sync_ready = True
             else:
                 logger.warning(
                     "Matrix: initial sync returned unexpected type %s",
@@ -1728,13 +1774,28 @@ class MatrixAdapter(BasePlatformAdapter):
             except Exception as exc:
                 logger.warning("Matrix: initial key share failed: %s", exc)
 
+        if self._readiness_file is not None and not initial_sync_ready:
+            logger.error(
+                "Matrix: initial sync did not produce a readiness token; refusing ready state"
+            )
+            await self.disconnect()
+            return False
+
         # Start the sync loop.
         self._sync_task = asyncio.create_task(self._sync_loop())
         self._mark_connected()
+        if initial_sync_ready:
+            try:
+                self._write_readiness()
+            except Exception:
+                logger.error("Matrix: failed to write readiness marker", exc_info=True)
+                await self.disconnect()
+                return False
         return True
 
     async def disconnect(self) -> None:
         """Disconnect from Matrix."""
+        self._clear_readiness()
         self._closing = True
 
         if self._sync_task and not self._sync_task.done():
@@ -1809,7 +1870,12 @@ class MatrixAdapter(BasePlatformAdapter):
                 last_event_id = str(event_id)
                 logger.info("Matrix: sent event %s to %s", last_event_id, chat_id)
             except Exception as exc:
-                # On E2EE errors, retry after sharing keys.
+                rate_limit = self._rate_limit_result(exc)
+                if rate_limit is not None:
+                    logger.warning("Matrix: rate-limited sending to %s", chat_id)
+                    return rate_limit
+                # On E2EE errors, retry after sharing keys. Flood-control
+                # failures were handled above and must never be retried here.
                 if self._encryption and getattr(self._client, "crypto", None):
                     try:
                         await self._client.crypto.share_keys()
@@ -1903,19 +1969,96 @@ class MatrixAdapter(BasePlatformAdapter):
     # Optional overrides
     # ------------------------------------------------------------------
 
+    @staticmethod
+    def _typing_thread_key(metadata: Optional[Dict[str, Any]]) -> str:
+        return str((metadata or {}).get("thread_id") or "")
+
+    async def _keep_typing(
+        self,
+        chat_id: str,
+        interval: float = 10.0,
+        metadata=None,
+        stop_event: asyncio.Event | None = None,
+    ) -> None:
+        current_task = asyncio.current_task()
+        thread_key = self._typing_thread_key(metadata)
+        if current_task is not None:
+            room_tasks = self._typing_tasks_by_room_and_thread.setdefault(chat_id, {})
+            room_tasks.setdefault(thread_key, set()).add(current_task)
+        try:
+            await super()._keep_typing(
+                chat_id,
+                interval=interval,
+                metadata=metadata,
+                stop_event=stop_event,
+            )
+        finally:
+            if current_task is not None:
+                room_tasks = self._typing_tasks_by_room_and_thread.get(chat_id)
+                if room_tasks is not None:
+                    owner_tasks = room_tasks.get(thread_key)
+                    if owner_tasks is not None:
+                        owner_tasks.discard(current_task)
+                        if not owner_tasks:
+                            room_tasks.pop(thread_key, None)
+                    if not room_tasks:
+                        self._typing_tasks_by_room_and_thread.pop(chat_id, None)
+
     async def send_typing(
         self, chat_id: str, metadata: Optional[Dict[str, Any]] = None
     ) -> None:
-        """Send a typing indicator."""
-        if self._client:
+        """Send at most one room-scoped typing refresh per second."""
+        if not self._client:
+            return
+        lock = self._typing_send_locks.setdefault(chat_id, asyncio.Lock())
+        async with lock:
+            now = time.monotonic()
+            last_sent = self._typing_last_sent_at.get(chat_id, 0.0)
+            if chat_id in self._typing_active_rooms and now - last_sent < 1.0:
+                return
             try:
                 await self._client.set_typing(RoomID(chat_id), timeout=30000)
+                self._typing_active_rooms.add(chat_id)
+                self._typing_last_sent_at[chat_id] = time.monotonic()
             except Exception:
                 pass
 
-    async def stop_typing(self, chat_id: str) -> None:
-        """Clear the typing indicator."""
-        if self._client:
+    async def stop_typing(
+        self,
+        chat_id: str,
+        metadata: Optional[Dict[str, Any]] = None,
+    ) -> None:
+        """Stop this thread's refreshers and clear only when the room is idle."""
+        thread_key = self._typing_thread_key(metadata)
+        current_task = asyncio.current_task()
+        room_tasks = self._typing_tasks_by_room_and_thread.get(chat_id, {})
+        owner_tasks = room_tasks.pop(thread_key, set())
+        for task in owner_tasks:
+            if task is not current_task and not task.done():
+                task.cancel()
+        live_room_tasks = {
+            owner: {
+                task
+                for task in tasks
+                if not task.done() and not task.cancelled()
+            }
+            for owner, tasks in room_tasks.items()
+        }
+        live_room_tasks = {
+            owner: tasks for owner, tasks in live_room_tasks.items() if tasks
+        }
+        if live_room_tasks:
+            self._typing_tasks_by_room_and_thread[chat_id] = live_room_tasks
+            return
+        self._typing_tasks_by_room_and_thread.pop(chat_id, None)
+        if not self._client:
+            return
+        lock = self._typing_send_locks.setdefault(chat_id, asyncio.Lock())
+        async with lock:
+            if chat_id not in self._typing_active_rooms:
+                return
+            self._typing_active_rooms.discard(chat_id)
+            self._typing_last_sent_at.pop(chat_id, None)
             try:
                 await self._client.set_typing(RoomID(chat_id), timeout=0)
             except Exception:
@@ -1945,12 +2088,19 @@ class MatrixAdapter(BasePlatformAdapter):
         )
 
     async def edit_message(
-        self, chat_id: str, message_id: str, content: str, *, finalize: bool = False
+        self,
+        chat_id: str,
+        message_id: str,
+        content: str,
+        *,
+        finalize: bool = False,
+        metadata: Optional[Dict[str, Any]] = None,
     ) -> SendResult:
         """Edit an existing message (via m.replace)."""
 
         formatted = self.format_message(content)
         new_content = self._build_text_message_content(formatted)
+        self._apply_relation_metadata(new_content, metadata=metadata)
         msg_content: Dict[str, Any] = {
             "msgtype": "m.text",
             "body": f"* {formatted}",
@@ -3547,12 +3697,34 @@ class MatrixAdapter(BasePlatformAdapter):
         task.add_done_callback(self._reaction_redaction_tasks.discard)
 
     async def on_processing_start(self, event: MessageEvent) -> None:
-        """Add eyes reaction when the agent starts processing a message."""
-        if not self._reactions_enabled:
-            return
+        """Acknowledge processing and expose new threads in Matrix clients.
+
+        Reactions do not count as thread replies, so a root message with only
+        the eyes reaction has no tappable thread summary in clients such as
+        Element X. Send one native thread reply for a newly-created root so
+        the user can enter the thread while the agent is still working.
+        """
         msg_id = event.message_id
         room_id = event.source.chat_id
-        if msg_id and room_id:
+        if not msg_id or not room_id:
+            return
+
+        thread_id = str(getattr(event.source, "thread_id", "") or "")
+        if thread_id == msg_id:
+            result = await self.send(
+                room_id,
+                "Working on it…",
+                metadata={"thread_id": thread_id},
+            )
+            if not result.success:
+                logger.debug(
+                    "Matrix: failed to send processing thread acknowledgement "
+                    "for %s: %s",
+                    msg_id,
+                    result.error,
+                )
+
+        if self._reactions_enabled:
             reaction_event_id = await self._send_reaction(room_id, msg_id, "\U0001f440")
             if reaction_event_id:
                 self._pending_reactions[(room_id, msg_id)] = reaction_event_id

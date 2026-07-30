@@ -773,6 +773,11 @@ class GatewayStreamConsumer:
                     or commentary_text is not None
                 )
                 if not self.cfg.buffer_only:
+                    # The threshold opens the first preview promptly. Once a
+                    # preview exists, cadence must be governed by the interval;
+                    # otherwise accumulated length stays above the threshold
+                    # forever and every token delta becomes an API edit.
+                    preview_not_open = self._message_id is None
                     should_edit = should_edit or (
                         (elapsed >= self._current_edit_interval
                             and self._accumulated)
@@ -780,7 +785,10 @@ class GatewayStreamConsumer:
                         # it's a debounce heuristic ("send updates roughly
                         # every N visible characters"), not a platform-limit
                         # check. _len_fn is reserved for overflow detection.
-                        or len(self._accumulated) >= self.cfg.buffer_threshold
+                        or (
+                            preview_not_open
+                            and len(self._accumulated) >= self.cfg.buffer_threshold
+                        )
                     )
 
                 current_update_visible = False
@@ -1525,9 +1533,17 @@ class GatewayStreamConsumer:
 
     def _is_flood_error(self, result) -> bool:
         """Check if a SendResult failure is due to flood control / rate limiting."""
+        if getattr(result, "error_kind", None) == "rate_limit":
+            return True
         err = getattr(result, "error", "") or ""
         err_lower = err.lower()
-        return "flood" in err_lower or "retry after" in err_lower or "rate" in err_lower
+        return (
+            "flood" in err_lower
+            or "retry after" in err_lower
+            or "rate" in err_lower
+            or "too many requests" in err_lower
+            or "m_limit_exceeded" in err_lower
+        )
 
     def _resolve_draft_streaming(self) -> bool:
         """Decide whether this run should use native draft streaming.

@@ -1,5 +1,7 @@
 """Tests for Matrix platform adapter (mautrix-python backend)."""
 import asyncio
+import json
+import os
 import re
 import stat
 import sys
@@ -320,6 +322,22 @@ def _make_adapter():
     return adapter
 
 
+def test_matrix_readiness_marker_is_owned_and_cleared(tmp_path):
+    adapter = _make_adapter()
+    marker = tmp_path / "matrix-ready.json"
+    adapter._readiness_file = marker
+
+    adapter._write_readiness()
+
+    payload = json.loads(marker.read_text(encoding="utf-8"))
+    assert payload["pid"] == os.getpid()
+    assert payload["user_id"] == "@bot:example.org"
+    assert marker.stat().st_mode & 0o777 == 0o600
+
+    adapter._clear_readiness()
+    assert not marker.exists()
+
+
 # ---------------------------------------------------------------------------
 # Typing indicator
 # ---------------------------------------------------------------------------
@@ -335,6 +353,8 @@ class TestMatrixTypingIndicator:
         """stop_typing() should send typing=false instead of waiting for timeout expiry."""
         from plugins.platforms.matrix.adapter import RoomID
 
+        await self.adapter.send_typing("!room:example.org")
+        self.adapter._client.set_typing.reset_mock()
         await self.adapter.stop_typing("!room:example.org")
 
         self.adapter._client.set_typing.assert_awaited_once_with(
@@ -349,8 +369,46 @@ class TestMatrixTypingIndicator:
 
     @pytest.mark.asyncio
     async def test_stop_typing_suppresses_exceptions(self):
+        await self.adapter.send_typing("!room:example.org")
         self.adapter._client.set_typing = AsyncMock(side_effect=Exception("network"))
         await self.adapter.stop_typing("!room:example.org")  # should not raise
+
+    @pytest.mark.asyncio
+    async def test_typing_start_and_stop_are_room_idempotent(self):
+        await asyncio.gather(
+            self.adapter.send_typing("!room:example.org"),
+            self.adapter.send_typing("!room:example.org"),
+            self.adapter.send_typing("!room:example.org"),
+        )
+        assert self.adapter._client.set_typing.await_count == 1
+
+        await asyncio.gather(
+            self.adapter.stop_typing("!room:example.org"),
+            self.adapter.stop_typing("!room:example.org"),
+            self.adapter.stop_typing("!room:example.org"),
+        )
+        assert self.adapter._client.set_typing.await_count == 2
+        assert self.adapter._client.set_typing.await_args.kwargs["timeout"] == 0
+
+    @pytest.mark.asyncio
+    async def test_edit_message_preserves_thread_metadata_in_new_content(self):
+        self.adapter._client.send_message_event = AsyncMock(return_value="$edit")
+
+        result = await self.adapter.edit_message(
+            "!room:example.org",
+            "$original",
+            "updated",
+            metadata={"thread_id": "$thread"},
+        )
+
+        assert result.success is True
+        content = self.adapter._client.send_message_event.await_args.args[2]
+        assert content["m.relates_to"] == {
+            "rel_type": "m.replace",
+            "event_id": "$original",
+        }
+        assert content["m.new_content"]["m.relates_to"]["rel_type"] == "m.thread"
+        assert content["m.new_content"]["m.relates_to"]["event_id"] == "$thread"
 
     def test_rate_limit_is_retryable_with_conservative_cooldown(self):
         class RateLimitError(RuntimeError):
@@ -1564,6 +1622,30 @@ class TestMatrixEncryptedSendFallback:
         mock_crypto.share_keys.assert_awaited_once()
         assert fake_client.send_message_event.await_count == 2
 
+    @pytest.mark.asyncio
+    async def test_encrypted_send_does_not_retry_rate_limit(self):
+        adapter = _make_adapter()
+        adapter._encryption = True
+
+        class RateLimitError(Exception):
+            http_status = 429
+
+        rate_limit = RateLimitError("M_LIMIT_EXCEEDED: too many requests")
+        fake_client = MagicMock()
+        fake_client.send_message_event = AsyncMock(side_effect=rate_limit)
+        mock_crypto = MagicMock()
+        mock_crypto.share_keys = AsyncMock()
+        fake_client.crypto = mock_crypto
+        adapter._client = fake_client
+
+        result = await adapter.send("!room:example.org", "hello")
+
+        assert result.success is False
+        assert result.retryable is True
+        assert result.retry_after == 10.0
+        mock_crypto.share_keys.assert_not_awaited()
+        assert fake_client.send_message_event.await_count == 1
+
 
 # ---------------------------------------------------------------------------
 # E2EE: _joined_rooms reference preservation for CryptoStateStore
@@ -1800,6 +1882,62 @@ class TestMatrixReactions:
         assert content["m.relates_to"]["rel_type"] == "m.annotation"
         assert content["m.relates_to"]["key"] == "\U0001f44d"
 
+
+    @pytest.mark.asyncio
+    async def test_on_processing_start_exposes_new_thread_immediately(self):
+        from gateway.platforms.base import MessageEvent, MessageType
+
+        self.adapter._reactions_enabled = True
+        self.adapter._pending_reactions = {}
+        self.adapter._send_reaction = AsyncMock(return_value="$eyes")
+        self.adapter.send = AsyncMock(return_value=MagicMock(success=True))
+        source = MagicMock()
+        source.chat_id = "!room:ex"
+        source.thread_id = "$msg1"
+        event = MessageEvent(
+            text="hello",
+            message_type=MessageType.TEXT,
+            source=source,
+            raw_message={},
+            message_id="$msg1",
+        )
+
+        await self.adapter.on_processing_start(event)
+
+        self.adapter.send.assert_awaited_once_with(
+            "!room:ex",
+            "Working on it…",
+            metadata={"thread_id": "$msg1"},
+        )
+
+    @pytest.mark.asyncio
+    async def test_thread_ack_does_not_depend_on_reactions(self):
+        from gateway.platforms.base import MessageEvent, MessageType
+
+        self.adapter._reactions_enabled = False
+        self.adapter._send_reaction = AsyncMock()
+        self.adapter.send = AsyncMock(
+            return_value=MagicMock(success=True, message_id="$ack")
+        )
+        source = MagicMock()
+        source.chat_id = "!room:ex"
+        source.thread_id = "$msg1"
+        event = MessageEvent(
+            text="hello",
+            message_type=MessageType.TEXT,
+            source=source,
+            raw_message={},
+            message_id="$msg1",
+        )
+
+        await self.adapter.on_processing_start(event)
+
+        self.adapter.send.assert_awaited_once_with(
+            "!room:ex",
+            "Working on it…",
+            metadata={"thread_id": "$msg1"},
+        )
+        self.adapter._send_reaction.assert_not_awaited()
 
     @pytest.mark.asyncio
     async def test_on_processing_complete_sends_check(self):

@@ -1,12 +1,19 @@
 """Tests for gateway proxy mode — forwarding messages to a remote API server."""
 
+import asyncio
+from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
 from gateway.config import Platform, StreamingConfig
 from gateway.platforms.base import resolve_proxy_url
-from gateway.run import GatewayRunner
+from gateway.run import (
+    GatewayRunner,
+    _SSEFrameDecoder,
+    _deliver_replaceable_progress,
+    _finalize_proxy_deliveries,
+)
 from gateway.session import SessionSource
 
 
@@ -34,6 +41,136 @@ def _make_source(platform=Platform.MATRIX):
         user_name="testuser",
         thread_id=None,
     )
+
+
+def test_sse_decoder_accepts_standard_frames_and_chunk_boundaries():
+    decoder = _SSEFrameDecoder()
+    assert decoder.feed("event: hermes.tool.progress\r\nda") == []
+    assert decoder.feed("ta:{\"tool_name\":\r\n") == []
+    frames = decoder.feed("data: \"terminal\",\"status\":\"running\"}\r\n\r\n")
+    assert frames == [
+        (
+            "hermes.tool.progress",
+            '{"tool_name":\n"terminal","status":"running"}',
+        )
+    ]
+
+
+def test_sse_decoder_preserves_utf8_split_at_every_byte_boundary():
+    payload = 'data: {"text":"💻"}\n\n'.encode()
+    for boundary in range(1, len(payload)):
+        decoder = _SSEFrameDecoder()
+        frames = decoder.feed(payload[:boundary])
+        frames += decoder.feed(payload[boundary:])
+        frames += decoder.finish()
+        assert frames == [("message", '{"text":"💻"}')]
+
+
+def test_sse_decoder_accepts_cr_only_and_bounds_whole_event(monkeypatch):
+    decoder = _SSEFrameDecoder()
+    frames = decoder.feed(b"event: note\rdata: one\r\r")
+    frames.extend(decoder.finish())
+    assert frames == [("note", "one")]
+
+    monkeypatch.setattr("gateway.run._GATEWAY_PROXY_SSE_BUFFER_MAX_CHARS", 40)
+    decoder = _SSEFrameDecoder()
+    with pytest.raises(ValueError, match="event exceeded"):
+        decoder.feed(("data: 1234567890\n" * 3).encode())
+
+
+def test_sse_decoder_preserves_crlf_split_at_every_byte_boundary():
+    payload = b"event: hermes.tool.progress\r\ndata: one\r\ndata: two\r\n\r\n"
+    expected = [("hermes.tool.progress", "one\ntwo")]
+
+    for boundary in range(1, len(payload)):
+        decoder = _SSEFrameDecoder()
+        frames = decoder.feed(payload[:boundary])
+        frames.extend(decoder.feed(payload[boundary:]))
+        frames.extend(decoder.finish())
+        assert frames == expected, boundary
+
+
+@pytest.mark.asyncio
+async def test_retryable_progress_edit_does_not_fallback_to_new_send():
+    adapter = MagicMock()
+    retry = SimpleNamespace(
+        success=False,
+        retryable=True,
+        retry_after=10.0,
+        error_kind="rate_limit",
+    )
+    adapter.edit_message = AsyncMock(return_value=retry)
+    adapter.send = AsyncMock()
+
+    result, message_id = await _deliver_replaceable_progress(
+        adapter,
+        "!room:example.org",
+        "$progress",
+        "working",
+        {"thread_id": "$thread"},
+    )
+
+    assert result is retry
+    assert message_id == "$progress"
+    adapter.send.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_answer_stream_finalizes_before_progress_close_failure():
+    events = []
+    consumer = MagicMock()
+    consumer.finish.side_effect = lambda: events.append("answer-finished")
+
+    async def run_stream():
+        while "answer-finished" not in events:
+            await asyncio.sleep(0)
+        events.append("answer-task-finished")
+
+    stream_task = asyncio.create_task(run_stream())
+    progress = MagicMock()
+
+    async def fail_close():
+        events.append("progress-close")
+        raise RuntimeError("429 retry exhausted")
+
+    progress.close = fail_close
+    await _finalize_proxy_deliveries(consumer, stream_task, progress)
+
+    assert events == [
+        "answer-finished",
+        "answer-task-finished",
+        "progress-close",
+    ]
+
+
+@pytest.mark.asyncio
+async def test_cancellation_awaits_stream_and_closes_progress():
+    stream_cancelled = asyncio.Event()
+    progress_closed = asyncio.Event()
+
+    async def run_stream():
+        try:
+            await asyncio.Event().wait()
+        finally:
+            stream_cancelled.set()
+
+    class Progress:
+        async def close(self):
+            progress_closed.set()
+
+    stream_task = asyncio.create_task(run_stream())
+    finalizer = asyncio.create_task(
+        _finalize_proxy_deliveries(MagicMock(), stream_task, Progress())
+    )
+    await asyncio.sleep(0)
+    finalizer.cancel()
+
+    with pytest.raises(asyncio.CancelledError):
+        await finalizer
+
+    assert stream_task.done()
+    assert stream_cancelled.is_set()
+    assert progress_closed.is_set()
 
 
 class _FakeSSEResponse:
@@ -198,16 +335,22 @@ class TestRunAgentViaProxy:
                         ],
                         source=source,
                         session_id="session-abc",
+                        session_key="agent:main:matrix:group:room",
                     )
 
         # Verify request URL
         assert session.captured_url == "http://host:8642/v1/chat/completions"
 
         # Verify auth header
+        assert session.captured_headers is not None
         assert session.captured_headers["Authorization"] == "Bearer test-key-123"
 
-        # Verify session ID header
+        # Verify session ID and stable channel-scoped session key headers
         assert session.captured_headers["X-Hermes-Session-Id"] == "session-abc"
+        assert (
+            session.captured_headers["X-Hermes-Session-Key"]
+            == "agent:main:matrix:group:room"
+        )
 
         # Verify messages include system, history, and current message
         messages = session.captured_json["messages"]
@@ -222,6 +365,140 @@ class TestRunAgentViaProxy:
         # Verify response was assembled
         assert result["final_response"] == "Hello world"
 
+    @pytest.mark.asyncio
+    async def test_channel_override_selects_remote_model_route(self, monkeypatch):
+        monkeypatch.setenv("GATEWAY_PROXY_URL", "http://host:8642")
+        runner = _make_runner()
+        source = _make_source()
+        resp = _FakeSSEResponse(
+            status=200,
+            sse_chunks=[
+                'data: {"choices":[{"delta":{"content":"ok"}}]}\n\n'
+                'data: [DONE]\n\n'
+            ],
+        )
+        session = _FakeSession(resp)
+
+        with patch("gateway.run._get_channel_override") as get_override:
+            get_override.return_value = SimpleNamespace(
+                provider="openrouter", model="openai/gpt-5.4"
+            )
+            with patch("gateway.run._load_gateway_config", return_value={}):
+                with _patch_aiohttp(session):
+                    with patch("aiohttp.ClientTimeout"):
+                        await runner._run_agent_via_proxy(
+                            message="route me",
+                            context_prompt="",
+                            history=[],
+                            source=source,
+                            session_id="session-route",
+                        )
+
+        assert session.captured_json is not None
+        assert session.captured_json["model"] == "openai/gpt-5.4"
+        assert session.captured_json["provider"] == "openrouter"
+
+    @pytest.mark.asyncio
+    async def test_provider_only_channel_override_is_forwarded(self, monkeypatch):
+        monkeypatch.setenv("GATEWAY_PROXY_URL", "http://host:8642")
+        runner = _make_runner()
+        response = _FakeSSEResponse(
+            status=200,
+            sse_chunks=['data: {"choices":[{"delta":{"content":"ok"}}]}\n\n'],
+        )
+        session = _FakeSession(response)
+
+        with patch("gateway.run._get_channel_override") as get_override:
+            get_override.return_value = SimpleNamespace(provider="anthropic", model="")
+            with patch("gateway.run._load_gateway_config", return_value={}):
+                with _patch_aiohttp(session):
+                    with patch("aiohttp.ClientTimeout"):
+                        await runner._run_agent_via_proxy(
+                            message="route me",
+                            context_prompt="",
+                            history=[],
+                            source=_make_source(),
+                            session_id="session-provider",
+                        )
+
+        assert session.captured_json is not None
+        assert session.captured_json["provider"] == "anthropic"
+        assert session.captured_json["model"] == "hermes-agent"
+
+    @pytest.mark.asyncio
+    async def test_blank_internal_continuation_is_suppressed_before_http(
+        self, monkeypatch
+    ):
+        monkeypatch.setenv("GATEWAY_PROXY_URL", "http://host:8642")
+        runner = _make_runner()
+
+        with patch("aiohttp.ClientSession") as client_session:
+            result = await runner._run_agent_via_proxy(
+                message="   ",
+                context_prompt="",
+                history=[],
+                source=_make_source(),
+                session_id="session-resume",
+                session_key="agent:main:matrix:group:room",
+            )
+
+        client_session.assert_not_called()
+        assert result["final_response"] == ""
+        assert result["interrupted"] is True
+        assert result["completed"] is False
+
+    @pytest.mark.asyncio
+    async def test_matrix_proxy_surfaces_tool_progress_without_polluting_answer(
+        self, monkeypatch
+    ):
+        monkeypatch.setenv("GATEWAY_PROXY_URL", "http://host:8642")
+        runner = _make_runner()
+        source = _make_source()
+        adapter = MagicMock()
+        adapter.send_typing = AsyncMock()
+        adapter.send = AsyncMock(
+            return_value=SimpleNamespace(
+                success=True,
+                message_id="$progress",
+                retryable=False,
+            )
+        )
+        adapter.edit_message = AsyncMock(
+            return_value=SimpleNamespace(
+                success=True,
+                message_id="$progress",
+                retryable=False,
+            )
+        )
+        runner.adapters[Platform.MATRIX] = adapter
+        resp = _FakeSSEResponse(
+            status=200,
+            sse_chunks=[
+                'event: hermes.tool.progress\n'
+                'data: {"status":"running","tool":"terminal","emoji":"💻","label":"Running tests"}\n\n'
+                'data: {"choices":[{"delta":{"content":"Done"}}]}\n\n'
+                'data: [DONE]\n\n'
+            ],
+        )
+        session = _FakeSession(resp)
+
+        with patch("gateway.run._load_gateway_config", return_value={}):
+            with _patch_aiohttp(session):
+                with patch("aiohttp.ClientTimeout"):
+                    result = await runner._run_agent_via_proxy(
+                        message="test it",
+                        context_prompt="",
+                        history=[],
+                        source=source,
+                        session_id="session-tools",
+                    )
+
+        assert result["final_response"] == "Done"
+        adapter.send.assert_any_await(
+            source.chat_id,
+            "💻 Running tests",
+            metadata=None,
+        )
 
     @pytest.mark.asyncio
     async def test_handles_connection_error(self, monkeypatch):

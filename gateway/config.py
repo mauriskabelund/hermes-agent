@@ -741,6 +741,11 @@ class StreamingConfig:
     edit_interval: float = DEFAULT_STREAMING_EDIT_INTERVAL
     buffer_threshold: int = DEFAULT_STREAMING_BUFFER_THRESHOLD
     cursor: str = DEFAULT_STREAMING_CURSOR
+    # Matrix defaults to structural-boundary-only updates because frequent
+    # m.replace events can flicker in some clients and cost homeserver API
+    # quota. Opt in when the deployment and client are tuned for progressive
+    # edits. The cursor remains suppressed on Matrix either way.
+    matrix_progressive: bool = False
     # Ported from openclaw/openclaw#72038.  When >0, the final edit for
     # a long-running streamed response is delivered as a fresh message
     # if the original preview has been visible for at least this many
@@ -757,6 +762,7 @@ class StreamingConfig:
             "edit_interval": self.edit_interval,
             "buffer_threshold": self.buffer_threshold,
             "cursor": self.cursor,
+            "matrix_progressive": self.matrix_progressive,
             "fresh_final_after_seconds": self.fresh_final_after_seconds,
         }
 
@@ -806,6 +812,9 @@ class StreamingConfig:
                 data.get("buffer_threshold"), DEFAULT_STREAMING_BUFFER_THRESHOLD,
             ),
             cursor=data.get("cursor", DEFAULT_STREAMING_CURSOR),
+            matrix_progressive=_coerce_bool(
+                data.get("matrix_progressive"), False
+            ),
             fresh_final_after_seconds=_coerce_float(
                 data.get("fresh_final_after_seconds"), 0.0
             ),
