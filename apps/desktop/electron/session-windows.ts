@@ -70,6 +70,23 @@ function buildSessionWindowUrl(sessionId: string, { devServer, rendererIndexPath
   return `${pathToFileURL(rendererIndexPath).toString()}${query}${route}`
 }
 
+// Build the plain renderer URL for a full peer window. Named profiles ride in
+// the query string so the fresh renderer can activate the same profile as the
+// source window instead of falling back to the unconfigured default profile.
+function buildInstanceWindowUrl({ devServer, rendererIndexPath, profile }: any = {}) {
+  const base = devServer || pathToFileURL(rendererIndexPath).toString()
+  const key = typeof profile === 'string' ? profile.trim() : ''
+
+  if (!key || key === 'default') {
+    return base
+  }
+
+  const url = new URL(base)
+  url.searchParams.set('profile', key)
+
+  return url.toString()
+}
+
 // Full "instance" windows (⌘⇧N / the "New Window" command) open a complete app
 // peer, not a compact chat. Cascade each one off its source window's bounds so a
 // new window doesn't land exactly on top of the one it was spawned from. Pure so
@@ -153,6 +170,7 @@ function createSessionWindowRegistry() {
 }
 
 export {
+  buildInstanceWindowUrl,
   buildSessionWindowUrl,
   chatWindowWebPreferences,
   createSessionWindowRegistry,

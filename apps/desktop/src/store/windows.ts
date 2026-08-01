@@ -1,4 +1,5 @@
 import { notifyError } from './notifications'
+import { $activeGatewayProfile, normalizeProfileKey } from './profile'
 
 // Window flag set by the Electron main process when it opens a standalone
 // session window (see electron/main.ts buildSessionWindowUrl). It rides in the
@@ -6,6 +7,7 @@ import { notifyError } from './notifications'
 // never from the router. A "secondary" window renders a single chat without the
 // global session sidebar or the install / onboarding overlays.
 const SECONDARY_WINDOW_FLAG = 'secondary'
+const PROFILE_NAME_RE = /^[a-z0-9][a-z0-9_-]{0,63}$/
 
 let secondaryWindowCache: boolean | null = null
 
@@ -49,6 +51,16 @@ export function isWatchWindow(): boolean {
   watchWindowCache = result
 
   return result
+}
+
+export function initialWindowProfile(search = window.location.search): string | null {
+  try {
+    const value = new URLSearchParams(search).get('profile')?.trim() || ''
+
+    return value && PROFILE_NAME_RE.test(value) ? value : null
+  } catch {
+    return null
+  }
 }
 
 // True when running inside the Electron desktop shell (the preload bridge is
@@ -99,5 +111,6 @@ export async function openNewWindow(): Promise<void> {
     return
   }
 
-  await runWindowOpen(() => window.hermesDesktop.openWindow(), 'Could not open a new window')
+  const profile = normalizeProfileKey($activeGatewayProfile.get())
+  await runWindowOpen(() => window.hermesDesktop.openWindow(profile), 'Could not open a new window')
 }

@@ -1,6 +1,13 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 
-import { canOpenNewWindow, canOpenSessionWindow, openNewWindow, openSessionInNewWindow } from './windows'
+import { $activeGatewayProfile } from './profile'
+import {
+  canOpenNewWindow,
+  canOpenSessionWindow,
+  initialWindowProfile,
+  openNewWindow,
+  openSessionInNewWindow
+} from './windows'
 
 const desktopWindow = window as unknown as { hermesDesktop?: Window['hermesDesktop'] }
 const initialHermesDesktop = desktopWindow.hermesDesktop
@@ -23,6 +30,7 @@ function installBridge(
 
 beforeEach(() => {
   notifyError.mockClear()
+  $activeGatewayProfile.set('default')
 })
 
 afterEach(() => {
@@ -146,8 +154,18 @@ describe('openNewWindow', () => {
 
     await openNewWindow()
 
-    expect(openWindow).toHaveBeenCalledTimes(1)
+    expect(openWindow).toHaveBeenCalledWith('default')
     expect(notifyError).not.toHaveBeenCalled()
+  })
+
+  it('forwards the active profile', async () => {
+    const openWindow = vi.fn().mockResolvedValue({ ok: true })
+    installBridge(undefined, openWindow)
+    $activeGatewayProfile.set('atlas')
+
+    await openNewWindow()
+
+    expect(openWindow).toHaveBeenCalledWith('atlas')
   })
 
   it('notifies on an ok:false result', async () => {
@@ -156,5 +174,15 @@ describe('openNewWindow', () => {
     await openNewWindow()
 
     expect(notifyError).toHaveBeenCalledTimes(1)
+  })
+})
+
+describe('initialWindowProfile', () => {
+  it('reads a valid inherited profile', () => {
+    expect(initialWindowProfile('?profile=atlas')).toBe('atlas')
+  })
+
+  it('rejects an invalid inherited profile', () => {
+    expect(initialWindowProfile('?profile=../atlas')).toBeNull()
   })
 })

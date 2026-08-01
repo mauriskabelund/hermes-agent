@@ -167,6 +167,7 @@ import {
   revalidateRemoteConnection
 } from './remote-liveness'
 import {
+  buildInstanceWindowUrl,
   buildSessionWindowUrl,
   chatWindowWebPreferences,
   createSessionWindowRegistry,
@@ -5177,6 +5178,28 @@ function sendOpenFolderRequested() {
   webContents.send('hermes:open-folder-requested')
 }
 
+function sendNewWindowRequested() {
+  const target = BrowserWindow.getFocusedWindow() || mainWindow
+
+  if (!target || target.isDestroyed()) {
+    createInstanceWindow()
+
+    return
+  }
+
+  const { webContents } = target
+
+  if (!webContents || webContents.isDestroyed()) {
+    createInstanceWindow()
+
+    return
+  }
+
+  // The focused renderer owns the live profile selection. Ask it to open the
+  // peer so the profile crosses the IPC boundary with the request.
+  webContents.send('hermes:new-window-requested')
+}
+
 // Tell the renderer the machine just woke. Sleep silently drops the
 // renderer's WebSocket to the local backend; the renderer reconnects on this
 // signal so the chat composer doesn't stay stuck on "Starting Hermes...".
@@ -5321,7 +5344,7 @@ function buildApplicationMenu() {
       // No accelerator: ⌘⇧N is a rebindable renderer keybind (session.newWindow);
       // a menu accelerator would fight the rebind panel and (on macOS) be
       // swallowed before the renderer sees it. Here purely for discoverability.
-      { click: () => createInstanceWindow(), label: 'New Window' },
+      { click: () => sendNewWindowRequested(), label: 'New Window' },
       // Same no-accelerator rationale: ⌘O is the rebindable renderer keybind
       // (workspace.openFolder). Clicking runs the same open-folder-as-project
       // flow through the renderer.
@@ -8756,7 +8779,7 @@ function nextInstanceBounds() {
 // primary: it never overwrites the mainWindow global, doesn't start the backend
 // (the renderer's getConnection() joins the already-running one), and loads the
 // plain renderer URL so the full app renders.
-function createInstanceWindow() {
+function createInstanceWindow(profile: string | null = null) {
   const icon = getAppIconPath()
 
   const win = new BrowserWindow({
@@ -8799,7 +8822,15 @@ function createInstanceWindow() {
     instanceWindows.delete(win)
   })
 
-  loadWindowUrl(win, DEV_SERVER || pathToFileURL(resolveRendererIndex()).toString(), 'Instance window')
+  loadWindowUrl(
+    win,
+    buildInstanceWindowUrl({
+      devServer: DEV_SERVER,
+      rendererIndexPath: DEV_SERVER ? undefined : resolveRendererIndex(),
+      profile
+    }),
+    'Instance window'
+  )
 
   return win
 }
@@ -9459,8 +9490,14 @@ ipcMain.handle('hermes:window:openSession', async (_event, sessionId, opts) => {
 
   return { ok: true }
 })
-ipcMain.handle('hermes:window:openInstance', async () => {
-  createInstanceWindow()
+ipcMain.handle('hermes:window:openInstance', async (_event, profile) => {
+  const key = typeof profile === 'string' ? profile.trim() : ''
+
+  if (key && key !== 'default' && !PROFILE_NAME_RE.test(key)) {
+    return { ok: false, error: 'invalid-profile-name' }
+  }
+
+  createInstanceWindow(key || 'default')
 
   return { ok: true }
 })

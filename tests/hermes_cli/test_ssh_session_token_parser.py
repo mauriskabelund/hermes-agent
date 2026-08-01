@@ -54,3 +54,18 @@ def test_token_file_rejects_symlink(tmp_path, monkeypatch):
         reset_hermes_home_override(override)
 
 
+@pytest.mark.skipif(os.name == "nt", reason="POSIX token directory contract")
+def test_profile_accepts_token_from_machine_desktop_ssh_root(tmp_path, monkeypatch):
+    hermes_root = tmp_path / ".hermes"
+    profile_home = hermes_root / "profiles" / "atlas"
+    token_dir = hermes_root / "desktop-ssh" / ("a" * 32)
+    profile_home.mkdir(parents=True)
+    token_dir.mkdir(parents=True, mode=0o700)
+    token_path = token_dir / "0123456789abcdef.token"
+    token_path.write_text("b" * 64)
+    token_path.chmod(0o600)
+    monkeypatch.setenv("HERMES_HOME", str(profile_home))
+
+    assert _read_ssh_session_token_file(str(token_path)) == "b" * 64
+    assert not token_path.exists()
+

@@ -37,7 +37,7 @@ declare global {
       // Open a new full-chrome app window — a peer instance of the primary that
       // renders the complete app against the shared backend, so the user can run
       // multiple GUI windows at once.
-      openWindow: () => Promise<{ ok: boolean; error?: string }>
+      openWindow: (profile?: string | null) => Promise<{ ok: boolean; error?: string }>
       // Claim a one-shot cross-window ambient cue (turn-end sound / spoken
       // reply). Resolves true for the first window to claim a key, false for
       // peers — so N open windows don't all fire the same cue.
@@ -242,6 +242,7 @@ declare global {
       }
       onClosePreviewRequested?: (callback: () => void) => () => void
       onOpenFolderRequested?: (callback: () => void) => () => void
+      onNewWindowRequested?: (callback: () => void) => () => void
       onOpenUpdatesRequested?: (callback: () => void) => () => void
       onDeepLink?: (
         callback: (payload: { kind: string; name: string; params: Record<string, string> }) => void

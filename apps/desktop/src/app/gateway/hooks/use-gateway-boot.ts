@@ -38,6 +38,7 @@ import {
   setSessionsLoading
 } from '@/store/session'
 import { $attentionSessionIds, $workingSessionIds, resetTileRuntimeBindings } from '@/store/session-states'
+import { initialWindowProfile } from '@/store/windows'
 import type { RpcEvent } from '@/types/hermes'
 
 import { stashGatewaySurvivor, survivorIsStale, takeGatewaySurvivor } from './gateway-hmr-survivor'
@@ -239,9 +240,14 @@ export function useGatewayBoot({
       try {
         const pref = await desktop.profile?.get?.()
         const profileKey = (pref?.profile ?? '').trim() || 'default'
-        $activeGatewayProfile.set(profileKey)
         setPrimaryGateway(gateway, profileKey)
-        void ensureGatewayForProfile(profileKey)
+        const targetProfile = initialWindowProfile() || profileKey
+        $activeGatewayProfile.set(targetProfile)
+        await ensureGatewayForProfile(targetProfile)
+
+        if (targetProfile !== profileKey) {
+          publish(await desktop.getConnection(targetProfile))
+        }
       } catch {
         $activeGatewayProfile.set('default')
       }

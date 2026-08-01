@@ -6,7 +6,7 @@ contextBridge.exposeInMainWorld('hermesDesktop', {
   touchBackend: profile => ipcRenderer.invoke('hermes:backend:touch', profile),
   getGatewayWsUrl: profile => ipcRenderer.invoke('hermes:gateway:ws-url', profile),
   openSessionWindow: (sessionId, opts) => ipcRenderer.invoke('hermes:window:openSession', sessionId, opts),
-  openWindow: () => ipcRenderer.invoke('hermes:window:openInstance'),
+  openWindow: profile => ipcRenderer.invoke('hermes:window:openInstance', profile),
   claimAmbientCue: key => ipcRenderer.invoke('hermes:ambient:claim', key),
   petOverlay: {
     // Main renderer → main process: window lifecycle + drag. `request` is
@@ -217,6 +217,12 @@ contextBridge.exposeInMainWorld('hermesDesktop', {
     ipcRenderer.on('hermes:open-folder-requested', listener)
 
     return () => ipcRenderer.removeListener('hermes:open-folder-requested', listener)
+  },
+  onNewWindowRequested: callback => {
+    const listener = () => callback()
+    ipcRenderer.on('hermes:new-window-requested', listener)
+
+    return () => ipcRenderer.removeListener('hermes:new-window-requested', listener)
   },
   onOpenUpdatesRequested: callback => {
     const listener = () => callback()

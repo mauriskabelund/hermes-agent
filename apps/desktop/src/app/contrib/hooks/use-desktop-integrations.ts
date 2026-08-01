@@ -16,7 +16,7 @@ import {
 } from '@/store/session'
 import { onSessionsChanged } from '@/store/session-sync'
 import { openUpdatesWindow, startUpdatePoller, stopUpdatePoller } from '@/store/updates'
-import { isSecondaryWindow } from '@/store/windows'
+import { isSecondaryWindow, openNewWindow } from '@/store/windows'
 
 import { requestComposerFocus, requestComposerInsert } from '../../chat/composer/focus'
 import { appViewForPath, isOverlayView, NEW_CHAT_ROUTE, sessionRoute } from '../../routes'
@@ -191,6 +191,14 @@ export function useDesktopIntegrations({
   // File > Open Folder… — same open-folder-as-project upsert as the ⌘O keybind.
   useEffect(() => {
     const unsubscribe = window.hermesDesktop?.onOpenFolderRequested?.(() => void openFolderAsProject())
+
+    return () => unsubscribe?.()
+  }, [])
+
+  // File > New Window — let the focused renderer attach its active profile to
+  // the request so the peer does not boot into an unconfigured default.
+  useEffect(() => {
+    const unsubscribe = window.hermesDesktop?.onNewWindowRequested?.(() => void openNewWindow())
 
     return () => unsubscribe?.()
   }, [])

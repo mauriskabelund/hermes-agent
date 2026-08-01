@@ -3,6 +3,7 @@ import assert from 'node:assert/strict'
 import { test } from 'vitest'
 
 import {
+  buildInstanceWindowUrl,
   buildSessionWindowUrl,
   chatWindowWebPreferences,
   createSessionWindowRegistry,
@@ -86,6 +87,24 @@ test('buildSessionWindowUrl adds the watch flag for spectator windows, before th
   const url = buildSessionWindowUrl('abc', { devServer: 'http://localhost:5173', watch: true })
 
   assert.equal(url, 'http://localhost:5173/?win=secondary&watch=1#/abc')
+})
+
+test('buildInstanceWindowUrl carries a named profile into a dev-server window', () => {
+  const url = buildInstanceWindowUrl({ devServer: 'http://localhost:5173/', profile: 'atlas' })
+
+  assert.equal(url, 'http://localhost:5173/?profile=atlas')
+})
+
+test('buildInstanceWindowUrl carries a named profile into a packaged window', () => {
+  const url = buildInstanceWindowUrl({ rendererIndexPath: '/opt/app/index.html', profile: 'claudius' })
+
+  assert.match(url, /^file:\/\/.*index\.html\?profile=claudius$/)
+})
+
+test('buildInstanceWindowUrl leaves the default profile URL unchanged', () => {
+  const url = buildInstanceWindowUrl({ devServer: 'http://localhost:5173', profile: 'default' })
+
+  assert.equal(url, 'http://localhost:5173')
 })
 
 test('instanceWindowBounds cascades a new window off its source bounds', () => {
