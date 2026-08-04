@@ -123,10 +123,20 @@ def _(rid, params: dict) -> dict:
         )
     isolation_cfg = _load_dashboard_process_isolation_config()
     turn_isolation = _session_uses_compute_host(session, isolation_cfg)
-    # Re-bind to the current client transport for this request. This keeps
-    # streaming events on the active websocket even if an earlier disconnect
-    # or fallback moved the session transport to stdio.
-    if (t := current_transport()) is not None:
+    client_mode = str(params.get("client_mode") or "owner").strip().lower()
+    if client_mode not in {"owner", "companion"}:
+        return _err(rid, 4004, "client_mode must be owner or companion")
+    t = current_transport()
+    # A companion joins the same live run without stealing the owner's event
+    # route. Subscribe before accepting the prompt so even an immediate
+    # message.start cannot race ahead of the observer registration.
+    if client_mode == "companion":
+        if t is None or t is _stdio_transport:
+            return _err(rid, 4030, "companion submit requires a live client transport")
+        _session_event_hub.subscribe(sid, t)
+    # The historical owner path intentionally rebinds: Desktop reconnects and
+    # explicit session activation rely on the active socket becoming primary.
+    elif t is not None:
         session["transport"] = t
     while True:
         busy_transport = None
@@ -142,6 +152,8 @@ def _(rid, params: dict) -> dict:
         busy_response = _handle_busy_submit(
             rid, sid, session, text, busy_transport,
             queued=bool(params.get("queued")),
+            source=str(params.get("client") or params.get("source") or ""),
+            preserve_owner=client_mode == "companion",
         )
         if busy_response is not None:
             return busy_response
@@ -222,10 +234,19 @@ def _(rid, params: dict) -> dict:
         session["last_active"] = time.time()
         _start_inflight_turn(session, text)
 
+    requested_source = str(
+        params.get("client") or params.get("source") or ""
+    ).strip().lower()
+    run_source = requested_source or _session_source(session)
+    run_snapshot = _session_event_hub.begin_run(sid, run_source)
+
     if turn_isolation:
         isolated_response = _submit_prompt_to_compute_host(rid, sid, session, text)
         if not isolated_response.get("error"):
+            if client_mode == "companion" or is_truthy_value(params.get("include_run")):
+                isolated_response.setdefault("result", {})["run"] = run_snapshot
             return isolated_response
+        _session_event_hub.settle_run(sid, "dispatch_failed")
         logger.warning(
             "compute-host dispatch failed for session %s; falling back inline: %s",
             sid,
@@ -287,7 +308,10 @@ def _(rid, params: dict) -> dict:
     # `running` flag (a turn that died without clearing it) and recover the latter.
     session["_run_thread"] = run_thread
     run_thread.start()
-    return _ok(rid, {"status": "streaming"})
+    response = {"status": "streaming"}
+    if client_mode == "companion" or is_truthy_value(params.get("include_run")):
+        response["run"] = run_snapshot
+    return _ok(rid, response)
 
 
 @method("clipboard.paste")

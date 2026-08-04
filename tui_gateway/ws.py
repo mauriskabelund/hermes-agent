@@ -312,7 +312,11 @@ async def handle_ws(ws: Any) -> None:
                     # change_events: this backend broadcasts pet.changed /
                     # cron.changed / sessions.changed, so clients can demote
                     # their legacy polls to slow backstops.
-                    "payload": {"skin": server.resolve_skin(), "change_events": True},
+                    "payload": {
+                        "skin": server.resolve_skin(),
+                        "change_events": True,
+                        "cross_client_runtime": 1,
+                    },
                 },
             }
         )
@@ -450,6 +454,8 @@ async def handle_ws(ws: Any) -> None:
                 )
             except Exception:
                 _log.exception("ws transport teardown failed peer=%s", peer)
+            finally:
+                server._session_event_hub.unregister_transport(transport)
         try:
             await ws.close()
         except Exception as exc:
