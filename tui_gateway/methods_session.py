@@ -308,6 +308,9 @@ def _(rid, params: dict) -> dict:
     target = params.get("session_id", "")
     if not target:
         return _err(rid, 4006, "session_id required")
+    client_mode = str(params.get("client_mode") or "owner").strip().lower()
+    if client_mode not in {"owner", "companion"}:
+        return _err(rid, 4004, "client_mode must be owner or companion")
     try:
         cols = int(params.get("cols", 80))
     except (TypeError, ValueError):
@@ -372,14 +375,22 @@ def _(rid, params: dict) -> dict:
     profile_resume_cwd = str(found.get("cwd") or "").strip() or _profile_configured_cwd(
         profile_home
     )
+    companion_mode = client_mode == "companion"
 
     def _reuse_live_payload(sid: str, session: dict) -> dict:
+        transport = current_transport() or _stdio_transport
+        if companion_mode and transport is not _stdio_transport:
+            # Companion clients observe an existing runtime; they never replace
+            # the transport that owns Desktop/TUI interaction. This executes
+            # while session.resume's resume lock is held at every live-reuse
+            # call site, closing the discover-then-resume ownership race.
+            _session_event_hub.subscribe(sid, transport, after_sequence=0)
         payload = _live_session_payload(
             sid,
             session,
             cols=cols,
             touch=True,
-            transport=current_transport() or _stdio_transport,
+            transport=None if companion_mode else transport,
         )
         payload["resumed"] = target
         # A lazy watch session never owns a run loop, so its payload's running
@@ -626,12 +637,15 @@ def _(rid, params: dict) -> dict:
             if lease is not None:
                 lease.release()
             other_sid, other_session = live
+            transport = current_transport() or _stdio_transport
+            if companion_mode and transport is not _stdio_transport:
+                _session_event_hub.subscribe(other_sid, transport, after_sequence=0)
             payload = _live_session_payload(
                 other_sid,
                 other_session,
                 cols=cols,
                 touch=True,
-                transport=current_transport() or _stdio_transport,
+                transport=None if companion_mode else transport,
             )
             payload["resumed"] = target
             return _ok(rid, payload)
@@ -760,6 +774,58 @@ def _(rid, params: dict) -> dict:
         if not session.get("_finalized")
     ]
     return _ok(rid, {"sessions": rows})
+
+
+@method("session.observe")
+def _(rid, params: dict) -> dict:
+    """Observe a live session without rebinding its owner transport."""
+    sid = str(params.get("session_id") or "").strip()
+    if not sid:
+        return _err(rid, 4006, "session_id required")
+    session, err = _sess_nowait({"session_id": sid}, rid)
+    if err:
+        return err
+    transport = current_transport()
+    if transport is None or transport is _stdio_transport:
+        return _err(rid, 4030, "session observation requires a live client transport")
+    try:
+        after_sequence = int(params.get("after_sequence") or 0)
+    except (TypeError, ValueError):
+        return _err(rid, 4004, "after_sequence must be an integer")
+    result = _session_event_hub.subscribe(
+        sid,
+        transport,
+        after_sequence=max(0, after_sequence),
+    )
+    result["stored_session_id"] = str(session.get("session_key") or "")
+    result["runtime_session_id"] = sid
+    return _ok(rid, result)
+
+
+@method("session.unobserve")
+def _(rid, params: dict) -> dict:
+    sid = str(params.get("session_id") or "").strip()
+    if not sid:
+        return _err(rid, 4006, "session_id required")
+    transport = current_transport()
+    removed = bool(transport) and _session_event_hub.unsubscribe(sid, transport)
+    return _ok(rid, {"session_id": sid, "removed": removed})
+
+
+@method("session.runtime")
+def _(rid, params: dict) -> dict:
+    """Return authoritative live state without changing transport ownership."""
+    sid = str(params.get("session_id") or "").strip()
+    if not sid:
+        return _err(rid, 4006, "session_id required")
+    session, err = _sess_nowait({"session_id": sid}, rid)
+    if err:
+        return err
+    run = _session_event_hub.runtime(sid)
+    run["running"] = bool(session.get("running"))
+    run["stored_session_id"] = str(session.get("session_key") or "")
+    run["runtime_session_id"] = sid
+    return _ok(rid, {"run": run})
 
 
 @method("session.activate")
@@ -2728,6 +2794,7 @@ def _(rid, params: dict) -> dict:
             resolve_gateway_approval(session["session_key"], "deny", resolve_all=True)
         except Exception:
             pass
+        _session_event_hub.settle_run(sid, "cancelled")
         return _ok(rid, {"status": "interrupted", "turn_isolation": True})
     session, err = _sess(params, rid)
     if err:
@@ -2768,6 +2835,9 @@ def _(rid, params: dict) -> dict:
         resolve_gateway_approval(session["session_key"], "deny", resolve_all=True)
     except Exception:
         pass
+    _session_event_hub.settle_run(
+        str(params.get("session_id") or ""), "cancelled"
+    )
     return _ok(rid, {"status": "interrupted"})
 
 

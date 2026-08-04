@@ -41,6 +41,7 @@ from tui_gateway.turn_marker import (
     read_turn_marker,
     record_turn_start,
 )
+from tui_gateway.session_observer import SessionObserverHub
 from tui_gateway.transport import (
     StdioTransport,
     Transport,
@@ -153,6 +154,7 @@ _cfg_cache: dict | None = None
 _cfg_mtime: float | None = None
 _cfg_path = None
 _session_resume_lock = threading.Lock()
+_session_event_hub = SessionObserverHub()
 try:
     _slash_timeout = float(os.environ.get("HERMES_TUI_SLASH_TIMEOUT_S") or "45")
 except (ValueError, TypeError):
@@ -951,6 +953,14 @@ def _close_sessions_for_transport(
             _close_session_by_id(sid, end_reason=end_reason)
             reaped += 1
         else:
+            observers = _session_event_hub.observer_transports(
+                sid, excluding=transport
+            )
+            if observers:
+                # Preserve the live turn by promoting an authenticated observer
+                # instead of parking the session on the detached drop sink.
+                session["transport"] = observers[0]
+                continue
             # Point detached sessions at the drop sentinel (NOT real stdio) so
             # _ws_session_is_orphaned recognizes them and the grace-reap can
             # actually fire; a standalone `hermes --tui` keeps real _stdio.
@@ -1350,8 +1360,25 @@ def write_json(obj: dict) -> bool:
     """
     if obj.get("method") == "event":
         sid = ((obj.get("params") or {}).get("session_id")) or ""
-        if sid and (t := (_sessions.get(sid) or {}).get("transport")) is not None:
-            return t.write(obj)
+        if sid:
+            owner = (_sessions.get(sid) or {}).get("transport")
+            frame, observers = _session_event_hub.publish(obj)
+            delivered = False
+            if owner is not None:
+                delivered = bool(owner.write(frame))
+            for observer in observers:
+                if observer is owner:
+                    continue
+                try:
+                    delivered = bool(observer.write(frame)) or delivered
+                except Exception:
+                    _session_event_hub.unsubscribe(sid, observer)
+            if owner is not None or observers:
+                return delivered
+            # The event was still journaled and decorated even when no session
+            # owner/observer was registered (for example during a creation
+            # boundary). Preserve canonical run metadata on the fallback path.
+            return (current_transport() or _stdio_transport).write(frame)
 
     return (current_transport() or _stdio_transport).write(obj)
 
@@ -7026,7 +7053,14 @@ def _maybe_schedule_auto_continue(sid: str, session: dict, session_key: str) -> 
     return {"attempt": attempt, "interrupted_at": marker["started_at"]}
 
 
-def _enqueue_prompt(session: dict, text: Any, transport: Any) -> None:
+def _enqueue_prompt(
+    session: dict,
+    text: Any,
+    transport: Any,
+    *,
+    source: str = "",
+    preserve_owner: bool = False,
+) -> None:
     """Stash a message to run as the very next turn once the live one ends.
 
     Used when a prompt arrives mid-turn (see ``_handle_busy_submit``). A single
@@ -7043,7 +7077,12 @@ def _enqueue_prompt(session: dict, text: Any, transport: Any) -> None:
     ):
         prev = existing["text"]
         text = f"{prev}\n\n{text}" if prev and text else (prev or text)
-    session["queued_prompt"] = {"text": text, "transport": transport}
+    session["queued_prompt"] = {
+        "text": text,
+        "transport": transport,
+        "source": str(source or "").strip().lower(),
+        "preserve_owner": bool(preserve_owner),
+    }
 
 
 def _interrupt_busy_session(sid: str, session: dict, agent: Any) -> None:
@@ -7082,7 +7121,14 @@ def _interrupt_busy_session(sid: str, session: dict, agent: Any) -> None:
 
 
 def _handle_busy_submit(
-    rid, sid: str, session: dict, text: Any, transport: Any, queued: bool = False
+    rid,
+    sid: str,
+    session: dict,
+    text: Any,
+    transport: Any,
+    queued: bool = False,
+    source: str = "",
+    preserve_owner: bool = False,
 ) -> dict | None:
     """Apply the ``display.busy_input_mode`` policy to a prompt that lands while
     a turn is in flight, instead of rejecting it with ``session busy``.
@@ -7145,7 +7191,13 @@ def _handle_busy_submit(
     with session["history_lock"]:
         if not session.get("running"):
             return None
-        _enqueue_prompt(session, text, transport)
+        _enqueue_prompt(
+            session,
+            text,
+            transport,
+            source=source,
+            preserve_owner=preserve_owner,
+        )
         session["last_active"] = time.time()
 
     if mode != "queue":
@@ -7166,8 +7218,10 @@ def _drain_queued_prompt(rid, sid: str, session: dict) -> bool:
             return False
         session["queued_prompt"] = None
         session["running"] = True
-        if queued.get("transport") is not None:
+        if queued.get("transport") is not None and not queued.get("preserve_owner"):
             session["transport"] = queued["transport"]
+        run_source = str(queued.get("source") or "").strip() or _session_source(session)
+        _session_event_hub.begin_run(sid, run_source)
     try:
         if _session_uses_compute_host(session):
             resp = _submit_prompt_to_compute_host(rid, sid, session, queued["text"])
