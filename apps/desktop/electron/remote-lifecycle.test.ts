@@ -14,6 +14,7 @@ import {
   lockfilePath,
   openForward,
   ownershipDirectory,
+  persistCompanionToken,
   pidIsOurDashboard,
   probeRemotePlatform,
   PROTOCOL_VERSION,
@@ -81,6 +82,24 @@ function fakeSsh(rules: any[] = []) {
 test('locateHermes prefers the explicit profile path when executable', async () => {
   const ssh = fakeSsh([[/\[ -x .*\/opt\/hermes/, 'OK']])
   assert.equal(await locateHermes(ssh, '/opt/hermes'), '/opt/hermes')
+})
+
+test('persistCompanionToken writes through stdin into the private ownership directory', async () => {
+  const calls: Array<{ cmd: string; options: any }> = []
+  const ssh = {
+    async exec(cmd, options) {
+      calls.push({ cmd, options })
+      return ''
+    }
+  }
+
+  const tokenPath = await persistCompanionToken(ssh, OWNERSHIP_ID, SPAWN_NONCE, 'served-secret')
+
+  assert.equal(tokenPath, `~/.hermes/desktop-ssh/${OWNERSHIP_ID}/${SPAWN_NONCE}.token`)
+  assert.equal(calls.length, 1)
+  assert.equal(calls[0].options.stdinData, 'served-secret')
+  assert.ok(!calls[0].cmd.includes('served-secret'), 'secret must not appear in the remote command')
+  assert.match(calls[0].cmd, /python3 -c/)
 })
 
 test('locateHermes throws (no silent fallback) when an EXPLICIT path is not executable', async () => {
@@ -867,7 +886,7 @@ test('readLockfile accepts a complete owned lock', async () => {
   assert.deepEqual(result, lock)
 })
 
-test('connect() reuse path does not write a token file', async () => {
+test('connect() reuse path republishes the companion token without spawning', async () => {
   const reuseToken = 'stored-token'
   const lock = ownedLock({ tokenFingerprint: fingerprintToken(reuseToken) })
 
@@ -881,7 +900,13 @@ test('connect() reuse path does not write a token file', async () => {
 
   const result = await connect(connectDeps(ssh, { reuseToken, adoptServedToken: async (_b, t) => t }))
   assert.equal(result.reused, true)
-  assert.ok(!ssh.calls.some(c => /sys\.stdin\.buffer\.read/.test(c)), 'reuse must not upload a token file')
+  assert.equal(
+    ssh.calls.filter(c => /sys\.stdin\.buffer\.read/.test(c)).length,
+    1,
+    'reuse must refresh exactly one companion token file'
+  )
+  assert.ok(!ssh.calls.some(c => c.includes(reuseToken)), 'reuse token must not appear in a remote command')
+  assert.ok(!ssh.calls.some(c => /setsid/.test(c)), 'reuse must not spawn a new dashboard')
 })
 
 test('spawnRemoteDashboard fails with update-required when remote lacks --ssh-session-token-file', async () => {
