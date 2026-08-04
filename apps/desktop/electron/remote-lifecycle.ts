@@ -349,6 +349,46 @@ async function removeLockfile(ssh, ownershipId) {
   }
 }
 
+// Publish the adopted runtime token for same-user companion services (WebUI,
+// Hermex, and Watch). The SSH bootstrap file is consumed by the backend, so
+// write it back only after Desktop has authenticated and adopted the final
+// served token. The ownership directory is private and the write is atomic.
+async function persistCompanionToken(ssh, ownershipId, spawnNonce, token) {
+  const directory = ownershipDirectory(ownershipId)
+  const nonce = validateSpawnNonce(spawnNonce)
+  const tokenFilePath = `${directory}/${nonce}.token`
+  const temporaryName = `.${nonce}.companion.tmp`
+  const persistPy =
+    'import os,stat,sys\n' +
+    `d=os.path.expanduser(${shq(directory)})\n` +
+    `n=${shq(`${nonce}.token`)}\n` +
+    `t=${shq(temporaryName)}\n` +
+    'os.makedirs(d,mode=0o700,exist_ok=True)\n' +
+    'df=os.O_RDONLY|getattr(os,"O_DIRECTORY",0)|getattr(os,"O_NOFOLLOW",0)\n' +
+    'dd=os.open(d,df)\n' +
+    'try:\n' +
+    ' s=os.fstat(dd)\n' +
+    ' if not stat.S_ISDIR(s.st_mode):raise SystemExit("unsafe token directory")\n' +
+    ' if hasattr(os,"getuid") and s.st_uid!=os.getuid():raise SystemExit("token directory owner mismatch")\n' +
+    ' if (s.st_mode&0o777)!=0o700:os.fchmod(dd,0o700)\n' +
+    ' try:os.unlink(t,dir_fd=dd)\n' +
+    ' except FileNotFoundError:pass\n' +
+    ' fl=os.O_WRONLY|os.O_CREAT|os.O_EXCL|getattr(os,"O_NOFOLLOW",0)\n' +
+    ' fd=os.open(t,fl,0o600,dir_fd=dd)\n' +
+    ' try:\n' +
+    '  os.write(fd,sys.stdin.buffer.read())\n' +
+    '  os.fsync(fd)\n' +
+    ' finally:os.close(fd)\n' +
+    ' os.replace(t,n,src_dir_fd=dd,dst_dir_fd=dd)\n' +
+    'finally:\n' +
+    ' try:os.unlink(t,dir_fd=dd)\n' +
+    ' except FileNotFoundError:pass\n' +
+    ' os.close(dd)'
+
+  await ssh.exec(`python3 -c ${shq(persistPy)}`, { stdinData: String(token || '') })
+  return tokenFilePath
+}
+
 async function remotePidAlive(ssh, pid) {
   if (!pid || !Number.isInteger(Number(pid))) {
     return false
@@ -428,10 +468,22 @@ async function cleanupStale(ssh, ownershipId, lock, pidAlive = true) {
   }
 
   const expectedLogPath = lock?.spawnNonce ? spawnLogPath(ownershipId, lock.spawnNonce) : ''
+  const expectedTokenPath = lock?.spawnNonce
+    ? `${ownershipDirectory(ownershipId)}/${validateSpawnNonce(lock.spawnNonce)}.token`
+    : ''
 
   if (lock?.logPath === expectedLogPath) {
     try {
       await ssh.exec(`rm -f ${expandRemotePath(lock.logPath)}`)
+    } catch {
+      void 0
+    }
+  }
+
+
+  if (expectedTokenPath) {
+    try {
+      await ssh.exec(`rm -f ${expandRemotePath(expectedTokenPath)}`)
     } catch {
       void 0
     }
@@ -750,6 +802,8 @@ async function connect(deps) {
           )
 
           assertNotAborted(signal)
+          await persistCompanionToken(ssh, ownershipId, lock.spawnNonce, token)
+          assertNotAborted(signal)
           log(`reusing remote dashboard pid=${lock.pid} port=${lock.port}`)
 
           return {
@@ -835,6 +889,8 @@ async function connect(deps) {
     const token = await adoptOwnedServedToken(adoptServedToken, baseUrl, spawnToken, ssh, pid, 'remote dashboard')
 
     assertNotAborted(signal)
+    await persistCompanionToken(ssh, ownershipId, spawnNonce, token)
+    assertNotAborted(signal)
     const tokenFingerprint = fingerprintToken(token)
     await writeLockfile(ssh, ownershipId, { ...ownedSpawn, port: remotePort, tokenFingerprint })
     assertNotAborted(signal)
@@ -886,6 +942,7 @@ export {
   openForward,
   ownershipDirectory,
   pidIsOurDashboard,
+  persistCompanionToken,
   probeHermesVersion,
   probeRemoteHermesHome,
   probeRemotePlatform,
