@@ -2,7 +2,6 @@ import argparse
 import os
 
 import pytest
-from hermes_constants import set_hermes_home_override, reset_hermes_home_override
 
 from hermes_cli.main import _read_ssh_session_token_file, cmd_dashboard
 from hermes_cli.subcommands.dashboard import build_dashboard_parser
@@ -44,14 +43,12 @@ def test_token_file_rejects_symlink(tmp_path, monkeypatch):
     target.chmod(0o600)
     token_path = token_dir / "0123456789abcdef.token"
     token_path.symlink_to(target)
-    override = set_hermes_home_override(home / ".hermes")
-    try:
-        with pytest.raises(SystemExit, match="symlink|not accessible"):
-            _read_ssh_session_token_file(str(token_path))
-        assert not token_path.exists()
-        assert target.read_text() == "b" * 64
-    finally:
-        reset_hermes_home_override(override)
+    monkeypatch.setenv("HERMES_HOME", str(home / ".hermes"))
+
+    with pytest.raises(SystemExit, match="symlink|not accessible"):
+        _read_ssh_session_token_file(str(token_path))
+    assert not token_path.exists()
+    assert target.read_text() == "b" * 64
 
 
 @pytest.mark.skipif(os.name == "nt", reason="POSIX token directory contract")
@@ -68,4 +65,3 @@ def test_profile_accepts_token_from_machine_desktop_ssh_root(tmp_path, monkeypat
 
     assert _read_ssh_session_token_file(str(token_path)) == "b" * 64
     assert not token_path.exists()
-
