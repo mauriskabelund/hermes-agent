@@ -11625,6 +11625,43 @@ def test_session_active_list_excludes_finalized_sessions(monkeypatch):
     assert [row["id"] for row in session_rows] == ["sid-live"]
 
 
+def test_session_active_list_includes_recent_completed_runtime(monkeypatch):
+    previous_sessions = dict(server._sessions)
+    server._sessions.clear()
+    monkeypatch.setattr(server, "_get_db", lambda: None)
+    server._sessions["sid-short"] = _session(
+        agent=types.SimpleNamespace(model="model-short"),
+        session_key="key-short",
+        created_at=10.0,
+        last_active=20.0,
+    )
+    try:
+        run = server._session_event_hub.begin_run("sid-short", "desktop")
+        server._session_event_hub.publish(
+            {
+                "jsonrpc": "2.0",
+                "method": "event",
+                "params": {
+                    "session_id": "sid-short",
+                    "type": "message.complete",
+                    "payload": {"status": "complete"},
+                },
+            }
+        )
+        resp = server.handle_request(
+            {"id": "1", "method": "session.active_list", "params": {}}
+        )
+    finally:
+        server._sessions.clear()
+        server._sessions.update(previous_sessions)
+
+    runtime = resp["result"]["sessions"][0]["runtime"]
+    assert runtime["run_id"] == run["run_id"]
+    assert runtime["source"] == "desktop"
+    assert runtime["running"] is False
+    assert runtime["latest_sequence"] == 1
+
+
 
 def test_session_activate_returns_inflight_stream_before_completion(monkeypatch):
     """Switching into a still-running live session must hydrate partial output.
@@ -11748,7 +11785,8 @@ def test_session_activate_returns_prompt_queued_during_busy_turn(monkeypatch):
             }
         )
 
-        assert activated["result"]["queued"] == {"user": "newest prompt"}
+        assert activated["result"]["queued"]["user"] == "newest prompt"
+        assert activated["result"]["queued"]["queue_ticket"] == queued["result"]["queue_ticket"]
         assert "transport" not in activated["result"]["queued"]
     finally:
         server._sessions.pop("sid-live", None)

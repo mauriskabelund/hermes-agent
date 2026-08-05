@@ -7060,7 +7060,7 @@ def _enqueue_prompt(
     *,
     source: str = "",
     preserve_owner: bool = False,
-) -> None:
+) -> str:
     """Stash a message to run as the very next turn once the live one ends.
 
     Used when a prompt arrives mid-turn (see ``_handle_busy_submit``). A single
@@ -7068,8 +7068,12 @@ def _enqueue_prompt(
     consecutive-user merge in ``repair_message_sequence``) so nothing the user
     typed is dropped. ``transport`` is pinned so the drained turn streams back to
     the client that sent it even if the session transport is rebound meanwhile.
+    Returns the stable queue ticket that will identify the successor run.
     """
     existing = session.get("queued_prompt")
+    queue_ticket = str((existing or {}).get("queue_ticket") or "").strip()
+    if not queue_ticket:
+        queue_ticket = uuid.uuid4().hex
     if (
         existing
         and isinstance(existing.get("text"), str)
@@ -7082,7 +7086,9 @@ def _enqueue_prompt(
         "transport": transport,
         "source": str(source or "").strip().lower(),
         "preserve_owner": bool(preserve_owner),
+        "queue_ticket": queue_ticket,
     }
+    return queue_ticket
 
 
 def _interrupt_busy_session(sid: str, session: dict, agent: Any) -> None:
@@ -7163,7 +7169,15 @@ def _handle_busy_submit(
             if agent.steer(plain_text):
                 with session["history_lock"]:
                     session["last_active"] = time.time()
-                return _ok(rid, {"status": "steered"})
+                run = _session_event_hub.runtime(sid)
+                return _ok(
+                    rid,
+                    {
+                        "status": "steered",
+                        "run": run,
+                        "accepted_run_id": run.get("run_id"),
+                    },
+                )
         except Exception:
             pass  # fall through to queue
     # Text-only corrections redirect the live turn in place when the runtime
@@ -7182,7 +7196,15 @@ def _handle_busy_submit(
                 with session["history_lock"]:
                     _record_inflight_correction(session, plain_text)
                     session["last_active"] = time.time()
-                return _ok(rid, {"status": "redirected"})
+                run = _session_event_hub.runtime(sid)
+                return _ok(
+                    rid,
+                    {
+                        "status": "redirected",
+                        "run": run,
+                        "accepted_run_id": run.get("run_id"),
+                    },
+                )
         except Exception:
             pass  # preserve the proven interrupt + queue fallback below
     # Queue before asking the live turn to stop. In particular, never call a
@@ -7191,7 +7213,7 @@ def _handle_busy_submit(
     with session["history_lock"]:
         if not session.get("running"):
             return None
-        _enqueue_prompt(
+        queue_ticket = _enqueue_prompt(
             session,
             text,
             transport,
@@ -7202,7 +7224,7 @@ def _handle_busy_submit(
 
     if mode != "queue":
         _interrupt_busy_session(sid, session, agent)
-    return _ok(rid, {"status": "queued"})
+    return _ok(rid, {"status": "queued", "queue_ticket": queue_ticket})
 
 
 def _drain_queued_prompt(rid, sid: str, session: dict) -> bool:
@@ -7221,7 +7243,11 @@ def _drain_queued_prompt(rid, sid: str, session: dict) -> bool:
         if queued.get("transport") is not None and not queued.get("preserve_owner"):
             session["transport"] = queued["transport"]
         run_source = str(queued.get("source") or "").strip() or _session_source(session)
-        _session_event_hub.begin_run(sid, run_source)
+        _session_event_hub.begin_run(
+            sid,
+            run_source,
+            queue_ticket=str(queued.get("queue_ticket") or "") or None,
+        )
     try:
         if _session_uses_compute_host(session):
             resp = _submit_prompt_to_compute_host(rid, sid, session, queued["text"])
@@ -7322,7 +7348,13 @@ def _queued_prompt_snapshot(session: dict) -> dict | None:
     if not isinstance(queued, dict):
         return None
     user = _inflight_text(queued.get("text"))
-    return {"user": user} if user else None
+    if not user:
+        return None
+    snapshot = {"user": user}
+    queue_ticket = str(queued.get("queue_ticket") or "").strip()
+    if queue_ticket:
+        snapshot["queue_ticket"] = queue_ticket
+    return snapshot
 
 
 # ── Methods: session ─────────────────────────────────────────────────

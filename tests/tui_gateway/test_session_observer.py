@@ -92,6 +92,25 @@ def test_replay_is_bounded_and_reports_gap():
     assert replay["run"]["latest_sequence"] == 3
 
 
+def test_recent_runtime_exposes_short_completed_run_for_bounded_window(monkeypatch):
+    from tui_gateway import session_observer
+
+    now = 1000.0
+    monkeypatch.setattr(session_observer.time, "time", lambda: now)
+    hub = SessionObserverHub()
+    run = hub.begin_run("runtime-1", "desktop")
+    hub.publish(_event("runtime-1", "message.complete", {"status": "complete"}))
+
+    recent = hub.recent_runtime("runtime-1", max_age_seconds=30)
+    assert recent is not None
+    assert recent["run_id"] == run["run_id"]
+    assert recent["running"] is False
+    assert recent["latest_sequence"] == 1
+
+    now = 1031.0
+    assert hub.recent_runtime("runtime-1", max_age_seconds=30) is None
+
+
 def test_disconnect_promotes_observer_instead_of_orphaning(monkeypatch):
     hub = SessionObserverHub()
     monkeypatch.setattr(server, "_session_event_hub", hub)
@@ -262,6 +281,7 @@ def test_companion_queued_prompt_keeps_owner_when_drained(monkeypatch):
         server, "_run_prompt_submit", lambda _rid, _sid, _session, text: drained.append(text)
     )
     try:
+        current_run = hub.begin_run("runtime-1", "desktop")
         response = server.dispatch(
             {
                 "id": "queue",
@@ -277,10 +297,108 @@ def test_companion_queued_prompt_keeps_owner_when_drained(monkeypatch):
             companion,
         )
         assert response["result"]["status"] == "queued"
+        queue_ticket = response["result"]["queue_ticket"]
+        assert queue_ticket
+        assert hub.runtime("runtime-1")["run_id"] == current_run["run_id"]
+        assert hub.runtime("runtime-1")["queue_ticket"] is None
         session["running"] = False
         assert server._drain_queued_prompt("queue", "runtime-1", session)
         assert drained == ["next"]
         assert session["transport"] is owner
-        assert hub.runtime("runtime-1")["source"] == "watch"
+        successor = hub.runtime("runtime-1")
+        assert successor["source"] == "watch"
+        assert successor["run_id"] != current_run["run_id"]
+        assert successor["queue_ticket"] == queue_ticket
+
+        decorated, _targets = hub.publish(
+            _event("runtime-1", "message.delta", {"text": "queued answer"})
+        )
+        assert decorated["params"]["run"]["queue_ticket"] == queue_ticket
     finally:
         server._sessions.pop("runtime-1", None)
+
+
+def test_companion_steer_binds_to_the_active_run(monkeypatch):
+    class SteeringAgent:
+        def steer(self, text):
+            assert text == "also check the logs"
+            return True
+
+    hub = SessionObserverHub()
+    monkeypatch.setattr(server, "_session_event_hub", hub)
+    monkeypatch.setattr(server, "_ensure_active_session_slot", lambda *_args: None)
+    monkeypatch.setattr(server, "_load_dashboard_process_isolation_config", lambda: {})
+    monkeypatch.setattr(server, "_session_uses_compute_host", lambda *_args: False)
+    monkeypatch.setattr(server, "_load_busy_input_mode", lambda: "steer")
+    owner = RecordingTransport()
+    companion = RecordingTransport()
+    session = {
+        "transport": owner,
+        "session_key": "stored-1",
+        "running": True,
+        "history": [],
+        "history_lock": threading.RLock(),
+        "agent": SteeringAgent(),
+        "lazy": False,
+    }
+    server._sessions["runtime-1"] = session
+    try:
+        current_run = hub.begin_run("runtime-1", "desktop")
+        response = server.dispatch(
+            {
+                "id": "steer",
+                "method": "prompt.submit",
+                "params": {
+                    "session_id": "runtime-1",
+                    "text": "also check the logs",
+                    "client": "iphone",
+                    "client_mode": "companion",
+                },
+            },
+            companion,
+        )
+
+        assert response["result"]["status"] == "steered"
+        assert response["result"]["accepted_run_id"] == current_run["run_id"]
+        assert response["result"]["run"]["run_id"] == current_run["run_id"]
+        assert session["transport"] is owner
+    finally:
+        server._sessions.pop("runtime-1", None)
+
+
+def test_approval_response_forwards_request_identity(monkeypatch):
+    from tools import approval
+
+    captured: dict = {}
+
+    def resolve(session_key, choice, **kwargs):
+        captured.update(session_key=session_key, choice=choice, **kwargs)
+        return 1
+
+    monkeypatch.setattr(approval, "resolve_gateway_approval", resolve)
+    server._sessions["runtime-1"] = {
+        "session_key": "stored-1",
+        "history_lock": threading.RLock(),
+    }
+    try:
+        response = server.handle_request(
+            {
+                "id": "approval",
+                "method": "approval.respond",
+                "params": {
+                    "session_id": "runtime-1",
+                    "choice": "once",
+                    "request_id": "approval-123",
+                },
+            }
+        )
+    finally:
+        server._sessions.pop("runtime-1", None)
+
+    assert response["result"]["resolved"] == 1
+    assert captured == {
+        "session_key": "stored-1",
+        "choice": "once",
+        "resolve_all": False,
+        "request_id": "approval-123",
+    }

@@ -31,6 +31,7 @@ class _Journal:
     sequence: int = 0
     generation: int = 0
     run_id: str | None = None
+    queue_ticket: str | None = None
     source: str = "unknown"
     running: bool = False
     started_at: float | None = None
@@ -86,6 +87,7 @@ class SessionObserverHub:
         return {
             "session_id": session_id,
             "run_id": journal.run_id,
+            "queue_ticket": journal.queue_ticket,
             "generation": journal.generation,
             "source": journal.source,
             "running": journal.running,
@@ -96,13 +98,20 @@ class SessionObserverHub:
             "earliest_replay_sequence": earliest,
         }
 
-    def begin_run(self, session_id: str, source: str | None = None) -> dict[str, Any]:
+    def begin_run(
+        self,
+        session_id: str,
+        source: str | None = None,
+        *,
+        queue_ticket: str | None = None,
+    ) -> dict[str, Any]:
         """Create the canonical identity before a prompt begins emitting."""
         normalized_source = str(source or "unknown").strip().lower() or "unknown"
         with self._lock:
             journal = self._journal(session_id)
             journal.generation += 1
             journal.run_id = uuid.uuid4().hex
+            journal.queue_ticket = str(queue_ticket or "").strip() or None
             journal.source = normalized_source
             journal.running = True
             journal.started_at = time.time()
@@ -172,6 +181,33 @@ class SessionObserverHub:
         with self._lock:
             return self._snapshot(session_id, self._journal(session_id))
 
+    def recent_runtime(
+        self,
+        session_id: str,
+        *,
+        max_age_seconds: float = 30.0,
+    ) -> dict[str, Any] | None:
+        """Return a running or briefly completed runtime without creating one.
+
+        ``session.active_list`` uses this bounded visibility window to discover
+        short Desktop turns that can start and finish between companion polls.
+        Finished journals remain available for replay independently; this
+        method only limits discovery exposure.
+        """
+        with self._lock:
+            journal = self._journals.get(session_id)
+            if journal is None or not journal.run_id:
+                return None
+            if journal.running:
+                return self._snapshot(session_id, journal)
+            finished_at = journal.finished_at
+            if finished_at is None:
+                return None
+            age = max(0.0, time.time() - finished_at)
+            if age > max(0.0, float(max_age_seconds)):
+                return None
+            return self._snapshot(session_id, journal)
+
     def publish(self, frame: dict[str, Any]) -> tuple[dict[str, Any], list[Any]]:
         """Decorate, journal, and resolve observer targets for one event frame."""
         params = frame.get("params") if isinstance(frame, dict) else None
@@ -216,6 +252,8 @@ class SessionObserverHub:
                 "sequence": journal.sequence,
                 "source": journal.source,
             }
+            if journal.queue_ticket:
+                decorated_params["run"]["queue_ticket"] = journal.queue_ticket
 
             try:
                 encoded_size = len(

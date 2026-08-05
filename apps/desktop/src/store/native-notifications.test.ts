@@ -210,17 +210,41 @@ describe('respondToApprovalAction', () => {
 
   it('approves via approval.respond {choice: "once"} and clears the prompt', async () => {
     setActiveSessionId('bg')
-    setApprovalRequest({ command: 'rm -rf /', description: 'dangerous', sessionId: 'bg' })
+    setApprovalRequest({ command: 'rm -rf /', description: 'dangerous', requestId: 'approval-123', sessionId: 'bg' })
 
     await respondToApprovalAction('bg', 'approve')
 
-    expect(request).toHaveBeenCalledWith('approval.respond', { choice: 'once', session_id: 'bg' })
+    expect(request).toHaveBeenCalledWith('approval.respond', {
+      choice: 'once',
+      request_id: 'approval-123',
+      session_id: 'bg'
+    })
     expect($approvalRequest.get()).toBeNull()
   })
 
   it('rejects via approval.respond {choice: "deny"}', async () => {
     await respondToApprovalAction('bg', 'reject')
     expect(request).toHaveBeenCalledWith('approval.respond', { choice: 'deny', session_id: 'bg' })
+  })
+
+  it('keeps a newer prompt when a stale notification action is rejected', async () => {
+    setActiveSessionId('bg')
+    setApprovalRequest({
+      command: 'new command',
+      description: 'new approval',
+      requestId: 'new-request',
+      sessionId: 'bg'
+    })
+    request.mockResolvedValueOnce({ resolved: 0 })
+
+    await respondToApprovalAction('bg', 'approve', 'stale-request')
+
+    expect(request).toHaveBeenCalledWith('approval.respond', {
+      choice: 'once',
+      request_id: 'stale-request',
+      session_id: 'bg'
+    })
+    expect($approvalRequest.get()?.requestId).toBe('new-request')
   })
 
   it('ignores unknown action ids', async () => {

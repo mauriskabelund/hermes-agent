@@ -4,7 +4,7 @@ import { persistString, storedString } from '@/lib/storage'
 
 import { $gateway } from './gateway'
 import { withinNativeNotifyBaseline } from './notify-baseline'
-import { clearApprovalRequest } from './prompts'
+import { clearApprovalRequest, sessionApprovalRequest } from './prompts'
 import { $activeSessionId } from './session'
 
 // Native OS notifications (Electron `Notification`), separate from the in-app
@@ -143,6 +143,7 @@ export interface NativeNotificationInput {
   kind: NativeNotificationKind
   title: string
   body?: string
+  requestId?: string
   sessionId?: null | string
   /**
    * Not tied to a chat session (e.g. pet generation). Fires whenever the user
@@ -177,6 +178,7 @@ export function dispatchNativeNotification(input: NativeNotificationInput): void
     actions: input.actions,
     body: input.body,
     kind: input.kind,
+    requestId: input.requestId,
     sessionId: input.sessionId ?? undefined,
     silent: input.silent,
     title: input.title
@@ -185,7 +187,11 @@ export function dispatchNativeNotification(input: NativeNotificationInput): void
 
 // Resolve a pending approval from a notification button, mirroring the in-app
 // Run/Reject bar. Keyed by session id — a background approval has no local guard.
-export async function respondToApprovalAction(sessionId: null | string, actionId: string): Promise<void> {
+export async function respondToApprovalAction(
+  sessionId: null | string,
+  actionId: string,
+  notificationRequestId?: string
+): Promise<void> {
   const choice = actionId === 'approve' ? 'once' : actionId === 'reject' ? 'deny' : null
 
   if (!choice) {
@@ -199,8 +205,16 @@ export async function respondToApprovalAction(sessionId: null | string, actionId
   }
 
   try {
-    await gateway.request('approval.respond', { choice, session_id: sessionId ?? undefined })
-    clearApprovalRequest(sessionId)
+    const requestId = notificationRequestId || sessionApprovalRequest(sessionId).get()?.requestId
+    const result = await gateway.request<{ resolved?: boolean | number }>('approval.respond', {
+      choice,
+      session_id: sessionId ?? undefined,
+      ...(requestId ? { request_id: requestId } : {})
+    })
+    if (result.resolved === false || result.resolved === 0) {
+      return
+    }
+    clearApprovalRequest(sessionId, requestId)
   } catch {
     // Leave the prompt parked so the user can still resolve it in-app.
   }

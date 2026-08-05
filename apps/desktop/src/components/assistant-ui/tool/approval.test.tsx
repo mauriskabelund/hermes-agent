@@ -33,7 +33,7 @@ function part(toolName: string): ToolPart {
 function setRequest(
   command = 'rm -rf /tmp/x',
   allowPermanent?: boolean,
-  extra: { choices?: string[]; smartDenied?: boolean } = {}
+  extra: { choices?: string[]; requestId?: string; smartDenied?: boolean } = {}
 ) {
   $activeSessionId.set('sess-1')
   setApprovalRequest({ allowPermanent, command, description: 'dangerous command', sessionId: 'sess-1', ...extra })
@@ -77,13 +77,17 @@ describe('PendingToolApproval', () => {
 
   it('sends approval.respond {choice: "once"} and clears the request on Run', async () => {
     const request = mockGateway()
-    setRequest()
+    setRequest(undefined, undefined, { requestId: 'approval-123' })
     render(<PendingToolApproval part={part('terminal')} />)
 
     fireEvent.click(screen.getByRole('button', { name: /Run/ }))
 
     await waitFor(() => {
-      expect(request).toHaveBeenCalledWith('approval.respond', { choice: 'once', session_id: 'sess-1' })
+      expect(request).toHaveBeenCalledWith('approval.respond', {
+        choice: 'once',
+        request_id: 'approval-123',
+        session_id: 'sess-1'
+      })
     })
     expect($approvalRequest.get()).toBeNull()
   })

@@ -338,6 +338,7 @@ export interface ClarifyRespondResponse {
 
 export interface ApprovalRespondResponse {
   ok?: boolean
+  resolved?: boolean | number
 }
 
 export interface SudoRespondResponse {
@@ -703,6 +704,7 @@ export type GatewayEvent =
         choices?: string[]
         command: string
         description: string
+        request_id?: string
         smart_denied?: boolean
       }
       session_id?: string

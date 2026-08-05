@@ -245,6 +245,7 @@ def _(rid, params: dict) -> dict:
         if not isolated_response.get("error"):
             if client_mode == "companion" or is_truthy_value(params.get("include_run")):
                 isolated_response.setdefault("result", {})["run"] = run_snapshot
+                isolated_response["result"]["accepted_run_id"] = run_snapshot.get("run_id")
             return isolated_response
         _session_event_hub.settle_run(sid, "dispatch_failed")
         logger.warning(
@@ -311,6 +312,7 @@ def _(rid, params: dict) -> dict:
     response = {"status": "streaming"}
     if client_mode == "companion" or is_truthy_value(params.get("include_run")):
         response["run"] = run_snapshot
+        response["accepted_run_id"] = run_snapshot.get("run_id")
     return _ok(rid, response)
 
 
@@ -900,6 +902,7 @@ def _(rid, params: dict) -> dict:
                     session["session_key"],
                     params.get("choice", "deny"),
                     resolve_all=params.get("all", False),
+                    request_id=params.get("request_id"),
                 )
             },
         )

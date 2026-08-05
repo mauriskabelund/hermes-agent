@@ -10281,7 +10281,11 @@ ipcMain.handle('hermes:notify', (_event, payload) => {
     const action = actions[index]
 
     if (action?.id) {
-      mainWindow.webContents.send('hermes:notification-action', { sessionId: payload?.sessionId, actionId: action.id })
+      mainWindow.webContents.send('hermes:notification-action', {
+        sessionId: payload?.sessionId,
+        requestId: payload?.requestId,
+        actionId: action.id
+      })
     }
   })
   notification.show()

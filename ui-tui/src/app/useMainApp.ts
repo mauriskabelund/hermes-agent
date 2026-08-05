@@ -20,6 +20,7 @@ import { composeTabTitle, fmtProjectCwdBranch, shortCwd } from '../domain/paths.
 import { sessionScopedModelArg } from '../domain/slash.js'
 import { type GatewayClient } from '../gatewayClient.js'
 import type {
+  ApprovalRespondResponse,
   ClarifyRespondResponse,
   ConfigSetResponse,
   GatewayEvent,
@@ -924,13 +925,22 @@ export function useMainApp(gw: GatewayClient) {
   )
 
   const answerApproval = useCallback(
-    (choice: string) =>
-      respondWith('approval.respond', { choice, session_id: ui.sid }, () => {
+    (choice: string) => {
+      const requestId = overlay.approval?.requestId
+      return rpc<ApprovalRespondResponse>('approval.respond', {
+        choice,
+        session_id: ui.sid,
+        ...(requestId ? { request_id: requestId } : {})
+      }).then(result => {
+        if (!result || result.resolved === false || result.resolved === 0) {
+          return
+        }
         patchOverlayState({ approval: null })
         patchTurnState({ outcome: choice === 'deny' ? 'denied' : `approved (${choice})` })
         patchUiState({ status: 'running…' })
-      }),
-    [respondWith, ui.sid]
+      })
+    },
+    [overlay.approval?.requestId, rpc, ui.sid]
   )
 
   const answerSudo = useCallback(

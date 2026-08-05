@@ -768,11 +768,18 @@ def _(rid, params: dict) -> dict:
     # Keep the natural creation/insertion order from ``_sessions``.  The
     # frontend marks the focused session with ``current``; it should not jump to
     # the top just because the user switched to it.
-    rows = [
-        _session_live_item(sid, session, current)
-        for sid, session in snapshot
-        if not session.get("_finalized")
-    ]
+    rows = []
+    for sid, session in snapshot:
+        if session.get("_finalized"):
+            continue
+        row = _session_live_item(sid, session, current)
+        recent_runtime = _session_event_hub.recent_runtime(
+            sid,
+            max_age_seconds=30.0,
+        )
+        if recent_runtime is not None:
+            row["runtime"] = recent_runtime
+        rows.append(row)
     return _ok(rid, {"sessions": rows})
 
 
