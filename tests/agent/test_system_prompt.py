@@ -116,6 +116,22 @@ class TestCodingContextBlock:
         assert "coding agent" not in _stable_prompt(agent)
 
 
+def test_skills_prompt_receives_agent_platform():
+    agent = _make_agent(valid_tool_names=["skills_list"], platform="cli")
+    with (
+        patch("run_agent.load_soul_md", return_value=""),
+        patch("run_agent.build_nous_subscription_prompt", return_value=""),
+        patch("run_agent.build_environment_hints", return_value=""),
+        patch("run_agent.build_context_files_prompt", return_value=""),
+        patch(
+            "run_agent.build_skills_system_prompt", return_value="skills"
+        ) as build_skills,
+    ):
+        build_system_prompt_parts(agent)
+
+    assert build_skills.call_args.kwargs["platform"] == "cli"
+
+
 def test_build_system_prompt_records_stable_prefix():
     agent = _make_agent()
     with (
