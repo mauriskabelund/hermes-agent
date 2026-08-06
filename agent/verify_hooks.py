@@ -33,7 +33,7 @@ CODING_VERIFY_GUIDANCE = (
 
 
 def max_verify_nudges(config: Optional[dict[str, Any]] = None) -> int:
-    """Bound on consecutive ``pre_verify`` continue directives per turn (>= 0)."""
+    """Shared per-turn bound for verification-stop continuations (>= 0)."""
     agent_cfg = _agent_cfg(config)
     raw = agent_cfg.get("max_verify_nudges")
     try:
