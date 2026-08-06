@@ -32,7 +32,10 @@ import {
 import nodePty from 'node-pty'
 
 import { classifyActiveRuntime } from './active-runtime-state'
-import { stopBackendChild as stopBackendChildImpl } from './backend-child'
+import {
+  stopBackendChild as stopBackendChildImpl,
+  waitForBackendExit as waitForBackendExitImpl
+} from './backend-child'
 import { dashboardFallbackArgs, sourceDeclaresServe } from './backend-command'
 import { createBackendConnectionState } from './backend-connection-state'
 import { buildDesktopBackendEnv, normalizeHermesHomeRoot } from './backend-env'
@@ -134,6 +137,11 @@ import {
   TEXT_PREVIEW_SOURCE_MAX_BYTES
 } from './hardening'
 import { createLinkTitleWindow, guardLinkTitleSession, readLinkTitleWindowTitle } from './link-title-window'
+import {
+  attachLocalCompanionRuntimeOrStop,
+  reapStaleLocalCompanionRuntimes,
+  resolveLocalCompanionProfile
+} from './local-companion-runtime'
 import { ensureMainWindow } from './main-window-lifecycle'
 import {
   oauthGuardMayHardFail,
@@ -572,6 +580,7 @@ function resolveHermesHome() {
 }
 
 const HERMES_HOME = resolveHermesHome()
+const LOCAL_COMPANION_ROOT = path.join(HERMES_HOME, 'desktop-ssh')
 
 function hermesManagedNodePathEntries() {
   // NOTE: keep this ordering in sync with iter_hermes_node_dirs() in
@@ -7867,6 +7876,10 @@ function stopBackendChild(child) {
   stopBackendChildImpl(child, { forceKillProcessTree, isWindows: IS_WINDOWS })
 }
 
+function waitForBackendExit(child) {
+  return waitForBackendExitImpl(child, { forceKillProcessTree, isWindows: IS_WINDOWS })
+}
+
 // Soft gateway-mode apply: tear down the primary without resetting boot UI or
 // reloading the renderer. The shell stays up; the renderer wipes session lists
 // (so skeletons retrigger) and re-dials. Distinct from hard re-home (profile
@@ -7920,42 +7933,11 @@ function sendConnectionApplied() {
   webContents.send('hermes:connection:applied')
 }
 
-async function waitForBackendExit(child, timeoutMs = 5000) {
-  if (!child) {
-    return
-  }
-
-  if (child.exitCode !== null || child.signalCode !== null) {
-    return
-  }
-
-  await new Promise<void>(resolve => {
-    const timer = setTimeout(() => {
-      try {
-        if (IS_WINDOWS && Number.isInteger(child.pid)) {
-          forceKillProcessTree(child.pid)
-        } else {
-          child.kill('SIGKILL')
-        }
-      } catch {
-        // Already gone.
-      }
-
-      resolve()
-    }, timeoutMs)
-
-    child.once('exit', () => {
-      clearTimeout(timer)
-      resolve()
-    })
-  })
-}
-
 // The profile the primary (window) backend runs as. readActiveDesktopProfile()
 // returns the desktop's stored preference, or null when unset (legacy launch
 // that defers to active_profile / default).
 function primaryProfileKey() {
-  return readActiveDesktopProfile() || 'default'
+  return resolveLocalCompanionProfile(readActiveDesktopProfile(), HERMES_HOME)
 }
 
 // Options describing the current connection setup for `resolveProfileBackendRoute`.
@@ -8230,6 +8212,21 @@ async function spawnPoolBackend(profile, entry) {
     )
   }
 
+  await attachLocalCompanionRuntimeOrStop({
+    attachment: {
+      child,
+      ownerPid: process.pid,
+      root: LOCAL_COMPANION_ROOT,
+      profile,
+      port: Number(port),
+      token: authToken,
+      onCleanupError: error =>
+        rememberLog(`Could not clean up companion runtime for profile "${profile}": ${String(error)}`)
+    },
+    stopChild: () => stopBackendChild(child),
+    waitForChildExit: () => waitForBackendExit(child)
+  })
+
   return {
     baseUrl,
     mode: 'local',
@@ -8309,6 +8306,12 @@ async function prepareProfileDeleteRequest(request) {
 }
 
 async function startHermes() {
+  const staleCompanionRuntimes = reapStaleLocalCompanionRuntimes(LOCAL_COMPANION_ROOT)
+
+  for (const error of staleCompanionRuntimes.errors) {
+    rememberLog(`[local companion] stale runtime cleanup failed: ${String(error)}`)
+  }
+
   // Latched-failure short-circuit: once bootstrap has failed in this
   // process, every subsequent startHermes() call re-throws the same error
   // without re-running install.ps1. This prevents the renderer's
@@ -8392,6 +8395,7 @@ async function startHermes() {
     // unset preference keeps the legacy launch so existing installs are
     // unaffected.
     const activeProfile = readActiveDesktopProfile()
+    const companionProfile = resolveLocalCompanionProfile(activeProfile, HERMES_HOME)
 
     if (activeProfile) {
       backendArgs.unshift('--profile', activeProfile)
@@ -8564,6 +8568,21 @@ async function startHermes() {
         `Local Hermes backend is HTTP-reachable but the WebSocket (/api/ws) rejected the session token: ${wsProbe.reason}`
       )
     }
+
+    await attachLocalCompanionRuntimeOrStop({
+      attachment: {
+        child: hermesProcess,
+        ownerPid: process.pid,
+        root: LOCAL_COMPANION_ROOT,
+        profile: companionProfile,
+        port: Number(port),
+        token: authToken,
+        onCleanupError: error =>
+          rememberLog(`Could not clean up companion runtime for profile "${companionProfile}": ${String(error)}`)
+      },
+      stopChild: () => stopBackendChild(hermesProcess),
+      waitForChildExit: () => waitForBackendExit(hermesProcess)
+    })
 
     updateBootProgress({
       phase: 'backend.ready',

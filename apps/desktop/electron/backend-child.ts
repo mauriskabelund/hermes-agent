@@ -36,6 +36,87 @@ export interface KillableChild {
  * throws (the process may already be gone) -- mirrors the original inline
  * best-effort semantics in main.ts.
  */
+export interface WaitableChild extends KillableChild {
+  exitCode?: number | null
+  signalCode?: string | null
+  once: (event: string, listener: (...args: any[]) => void) => unknown
+}
+
+export interface WaitForBackendExitDeps extends StopBackendChildDeps {
+  timeoutMs?: number
+  hardKillGraceMs?: number
+  onHardKill?: () => void
+}
+
+/** Wait until child exit is observed; hard-kill on timeout, then fail if still unobserved. */
+export async function waitForBackendExit(
+  child: WaitableChild | null | undefined,
+  deps: WaitForBackendExitDeps
+): Promise<void> {
+  if (!child) {
+    return
+  }
+
+  const hasExited =
+    (child.exitCode !== null && child.exitCode !== undefined) ||
+    (child.signalCode !== null && child.signalCode !== undefined)
+
+  if (hasExited) {
+    return
+  }
+
+  const timeoutMs = deps.timeoutMs ?? 5000
+  const hardKillGraceMs = deps.hardKillGraceMs ?? 2000
+
+  await new Promise<void>((resolve, reject) => {
+    let settled = false
+    let hardKillTimer: ReturnType<typeof setTimeout> | null = null
+
+    const settle = (error?: Error) => {
+      if (settled) {
+        return
+      }
+
+      settled = true
+      clearTimeout(softTimer)
+
+      if (hardKillTimer) {
+        clearTimeout(hardKillTimer)
+      }
+
+      if (error) {
+        reject(error)
+      } else {
+        resolve()
+      }
+    }
+
+    const softTimer = setTimeout(() => {
+      try {
+        if ((deps.isWindows ?? process.platform === 'win32') && Number.isInteger(child.pid)) {
+          deps.forceKillProcessTree(child.pid as number)
+        } else {
+          child.kill('SIGKILL')
+        }
+      } catch {
+        // The process may already be exiting; the exit event remains authoritative.
+      }
+
+      deps.onHardKill?.()
+      hardKillTimer = setTimeout(
+        () => settle(new Error('Backend child did not exit after hard kill')),
+        hardKillGraceMs
+      )
+    }, timeoutMs)
+
+    try {
+      child.once('exit', () => settle())
+    } catch (error) {
+      settle(error instanceof Error ? error : new Error(String(error)))
+    }
+  })
+}
+
 export function stopBackendChild(child: KillableChild | null | undefined, deps: StopBackendChildDeps) {
   if (!child || child.killed) {
     return
