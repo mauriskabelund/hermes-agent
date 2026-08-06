@@ -316,6 +316,97 @@ def _apply_ssh_owner_nonce(nonce: Optional[str]) -> None:
     global _SSH_OWNER_NONCE
     _SSH_OWNER_NONCE = nonce
 
+
+def _ssh_ownership_state(
+    token_file: str,
+    owner_nonce: str,
+    process_id: Optional[int] = None,
+) -> Literal["owned", "pending", "superseded"]:
+    """Return whether an SSH-isolated backend still owns its runtime slot.
+
+    Concurrent Desktop connection attempts can both observe an absent lock,
+    spawn, and then overwrite the same ownership record. The record's final
+    PID/nonce pair is authoritative; every other process is a race loser and
+    must not remain alive holding the shared state database.
+    """
+    token_path = Path(token_file).expanduser()
+    ownership_id = token_path.parent.name
+    if not re.fullmatch(r"[0-9a-f]{32}", ownership_id):
+        return "pending"
+
+    try:
+        lock = json.loads((token_path.parent / "backend.lock.json").read_text())
+        if not isinstance(lock, dict):
+            return "pending"
+        lock_pid = int(lock.get("pid", 0))
+        lock_nonce = str(lock.get("spawnNonce", ""))
+    except (OSError, TypeError, ValueError, json.JSONDecodeError):
+        return "pending"
+
+    if (
+        lock.get("ownershipId") != ownership_id
+        or lock_pid <= 0
+        or not re.fullmatch(r"[0-9a-f]{16}", lock_nonce)
+    ):
+        return "pending"
+
+    expected_pid = os.getpid() if process_id is None else process_id
+    if lock_pid == expected_pid and lock_nonce == owner_nonce:
+        return "owned"
+    return "superseded"
+
+
+def _start_ssh_ownership_watchdog(
+    server: Any,
+    token_file: Optional[str],
+    owner_nonce: Optional[str],
+    *,
+    poll_seconds: float = 2.0,
+    claim_timeout_seconds: float = 60.0,
+) -> Optional[threading.Event]:
+    """Self-reap a superseded Desktop SSH backend.
+
+    The token path identifies the remote Desktop installation's ownership
+    directory even though the one-time token itself is unlinked at startup.
+    Missing or partially written lockfiles get a bounded grace period; a valid
+    record naming another PID/nonce terminates this server immediately.
+    """
+    if not token_file or not owner_nonce:
+        return None
+
+    stop_event = threading.Event()
+
+    def _watch() -> None:
+        pending_since = time.monotonic()
+        while not stop_event.is_set():
+            state = _ssh_ownership_state(token_file, owner_nonce)
+            if state == "owned":
+                pending_since = time.monotonic()
+            elif state == "superseded":
+                _log.warning(
+                    "SSH backend ownership was superseded; stopping pid=%s",
+                    os.getpid(),
+                )
+                server.should_exit = True
+                return
+            elif time.monotonic() - pending_since >= claim_timeout_seconds:
+                _log.warning(
+                    "SSH backend ownership was not claimed within %.1fs; stopping pid=%s",
+                    claim_timeout_seconds,
+                    os.getpid(),
+                )
+                server.should_exit = True
+                return
+
+            stop_event.wait(poll_seconds)
+
+    threading.Thread(
+        target=_watch,
+        name="ssh-ownership-watchdog",
+        daemon=True,
+    ).start()
+    return stop_event
+
 # In-browser Chat tab (/chat, /api/pty, /api/ws, …).  Always enabled: the
 # desktop app and the dashboard's own Chat tab both drive the agent over the
 # `/api/ws` + `/api/pty` WebSockets, so the embedded-chat surface is an
@@ -17030,6 +17121,7 @@ def start_server(
     headless: bool = False,
     ssh_session_token: Optional[str] = None,
     ssh_owner_nonce: Optional[str] = None,
+    ssh_session_token_file: Optional[str] = None,
 ):
     """Start the web UI server.
 
@@ -17042,8 +17134,9 @@ def start_server(
     build and no SPA mount (mount_spa() honours ``HERMES_SERVE_HEADLESS``), so
     the banner announces the bind rather than a browser URL.
 
-    ``ssh_session_token`` and ``ssh_owner_nonce`` are process-local Desktop SSH
-    bootstrap state. Neither is persisted or exported to child processes.
+    ``ssh_session_token``, ``ssh_owner_nonce``, and ``ssh_session_token_file``
+    are process-local Desktop SSH bootstrap state. None is persisted or exported
+    to child processes.
     """
     _apply_ssh_session_token(ssh_session_token or "")
     _apply_ssh_owner_nonce(ssh_owner_nonce)
@@ -17214,6 +17307,11 @@ def start_server(
         ws_max_size=_DESKTOP_ATTACHMENT_WS_MAX_BYTES,
     )
     server = uvicorn.Server(config)
+    ssh_watchdog_stop = _start_ssh_ownership_watchdog(
+        server,
+        ssh_session_token_file,
+        ssh_owner_nonce,
+    )
 
     async def _serve():
         # Split startup from main_loop so we can read the bound port
@@ -17305,8 +17403,12 @@ def start_server(
     # no TCP handshake completing (#50641). So *only on Windows* we mirror
     # uvicorn's own machinery and run on the loop factory it picks.
     if sys.platform != "win32":
-        asyncio.run(_serve())
-        return
+        try:
+            asyncio.run(_serve())
+            return
+        finally:
+            if ssh_watchdog_stop is not None:
+                ssh_watchdog_stop.set()
 
     # Windows-only path. Resolve the runner + loop factory FIRST (and fall back
     # to a hand-installed Windows selector policy only when uvicorn predates the
@@ -17327,7 +17429,11 @@ def start_server(
         except Exception:
             pass
 
-    if _runner is not None:
-        _runner(_serve(), loop_factory=_loop_factory)
-    else:
-        asyncio.run(_serve())
+    try:
+        if _runner is not None:
+            _runner(_serve(), loop_factory=_loop_factory)
+        else:
+            asyncio.run(_serve())
+    finally:
+        if ssh_watchdog_stop is not None:
+            ssh_watchdog_stop.set()

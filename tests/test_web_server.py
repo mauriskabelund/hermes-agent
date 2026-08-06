@@ -6,6 +6,8 @@ Config + Server + asyncio.run to capture kwargs without starting an event loop.
 
 import asyncio
 import contextlib
+import json
+import time
 
 import uvicorn
 
@@ -83,6 +85,69 @@ def test_start_server_applies_process_local_ssh_bootstrap_state(monkeypatch):
     assert web_server._SESSION_TOKEN == "s" * 64
     assert web_server._SSH_OWNER_NONCE == "0123456789abcdef"
     assert captured["port"] == 0
+
+
+def test_ssh_ownership_state_tracks_authoritative_lock(tmp_path):
+    ownership_id = "a" * 32
+    owner_nonce = "0123456789abcdef"
+    token_dir = tmp_path / ownership_id
+    token_dir.mkdir()
+    token_file = token_dir / f"{owner_nonce}.token"
+    lock_file = token_dir / "backend.lock.json"
+
+    assert web_server._ssh_ownership_state(
+        str(token_file), owner_nonce, process_id=123
+    ) == "pending"
+
+    lock_file.write_text(json.dumps({
+        "ownershipId": ownership_id,
+        "spawnNonce": owner_nonce,
+        "pid": 123,
+    }))
+    assert web_server._ssh_ownership_state(
+        str(token_file), owner_nonce, process_id=123
+    ) == "owned"
+
+    lock_file.write_text(json.dumps({
+        "ownershipId": ownership_id,
+        "spawnNonce": "fedcba9876543210",
+        "pid": 456,
+    }))
+    assert web_server._ssh_ownership_state(
+        str(token_file), owner_nonce, process_id=123
+    ) == "superseded"
+
+
+def test_ssh_ownership_watchdog_stops_superseded_backend(tmp_path):
+    ownership_id = "b" * 32
+    owner_nonce = "0123456789abcdef"
+    token_dir = tmp_path / ownership_id
+    token_dir.mkdir()
+    token_file = token_dir / f"{owner_nonce}.token"
+    (token_dir / "backend.lock.json").write_text(json.dumps({
+        "ownershipId": ownership_id,
+        "spawnNonce": "fedcba9876543210",
+        "pid": 456,
+    }))
+
+    class _Server:
+        should_exit = False
+
+    server = _Server()
+    stop_event = web_server._start_ssh_ownership_watchdog(
+        server,
+        str(token_file),
+        owner_nonce,
+        poll_seconds=0.01,
+        claim_timeout_seconds=1.0,
+    )
+    deadline = time.monotonic() + 1.0
+    while not server.should_exit and time.monotonic() < deadline:
+        time.sleep(0.01)
+
+    assert server.should_exit is True
+    assert stop_event is not None
+    stop_event.set()
 
 
 def test_start_server_disables_ws_ping_on_loopback(monkeypatch):

@@ -10445,6 +10445,7 @@ def cmd_dashboard(args):
         headless=_headless_backend,
         ssh_session_token=_ssh_session_token,
         ssh_owner_nonce=_ssh_owner_nonce,
+        ssh_session_token_file=_token_file,
     )
 
 
