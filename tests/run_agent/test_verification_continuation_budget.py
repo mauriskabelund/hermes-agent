@@ -70,14 +70,53 @@ def test_verify_on_stop_preserves_composed_report_at_budget_limit(agent, monkeyp
     monkeypatch.setenv("HERMES_VERIFY_ON_STOP", "1")
 
     with (
-        patch("agent.verification_stop.build_verify_on_stop_nudge", return_value="verify it"),
+        patch(
+            "agent.verification_stop.build_verify_on_stop_nudge",
+            return_value="verify it",
+        ) as build_nudge,
+        patch("agent.verify_hooks.max_verify_nudges", return_value=1),
         patch("hermes_cli.plugins.invoke_hook", return_value=[]),
     ):
         result = agent.run_conversation("edit changed.py")
 
     _assert_pending_response_survives(agent, result)
+    assert build_nudge.call_args.kwargs["max_attempts"] == 1
     # The assistant response persists (it is real, unflagged content).
     assert not result["messages"][1].get("_verification_stop_synthetic")
+
+
+def test_verify_on_stop_and_pre_verify_share_one_budget(agent, monkeypatch):
+    agent.max_iterations = 2
+    agent.iteration_budget.max_total = 2
+    answers = iter([_response("premature report"), _response("verified report")])
+
+    def model_call(_api_kwargs):
+        agent._turn_file_mutation_paths = {"changed.py"}
+        return next(answers)
+
+    agent._interruptible_api_call = model_call
+    agent._handle_max_iterations = MagicMock(return_value="replacement summary")
+    monkeypatch.setenv("HERMES_VERIFY_ON_STOP", "1")
+
+    with (
+        patch(
+            "agent.verification_stop.build_verify_on_stop_nudge",
+            side_effect=["verify it", None],
+        ),
+        patch("agent.verify_hooks.max_verify_nudges", return_value=1),
+        patch("hermes_cli.plugins.has_hook", return_value=True) as has_hook,
+        patch(
+            "hermes_cli.plugins.get_pre_verify_continue_message",
+            return_value="run project tests",
+        ) as pre_verify,
+        patch("hermes_cli.plugins.invoke_hook", return_value=[]),
+    ):
+        result = agent.run_conversation("edit changed.py")
+
+    assert result["final_response"] == "verified report"
+    assert result["completed"] is True
+    assert not any(call.args == ("pre_verify",) for call in has_hook.call_args_list)
+    pre_verify.assert_not_called()
 
 
 def test_pre_verify_preserves_composed_report_at_budget_limit(agent, monkeypatch):
@@ -251,5 +290,3 @@ def test_streamed_interim_then_different_summary_not_marked_previewed(agent, mon
     # CRITICAL: response_previewed must be False — the interim narration was
     # NOT the final response, so the CLI must render the summary.
     assert result["response_previewed"] is False
-
-

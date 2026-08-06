@@ -76,6 +76,10 @@ class TestResolveSessionSource:
         _srv = _reload_resolver()
         assert _srv._resolve_session_source("telegram") == "telegram"
 
+    def test_legacy_webui_source_stays_durable(self, clean_env):
+        _srv = _reload_resolver()
+        assert _srv._resolve_session_source("webui") == "webui"
+
 
     def test_no_env_no_param_defaults_to_tui(self, clean_env):
         _srv = _reload_resolver()
@@ -83,6 +87,10 @@ class TestResolveSessionSource:
 
 
 class TestResolveAgentPlatform:
+
+    def test_legacy_webui_source_maps_to_desktop_agent_platform(self, clean_env):
+        _srv = _reload_resolver()
+        assert _srv._resolve_agent_platform("webui") == "desktop"
 
     def test_missing_source_falls_back_to_env_resolved_platform(self, clean_env):
         clean_env.setenv("HERMES_DESKTOP", "1")
@@ -95,5 +103,4 @@ class TestSessionSourceFallback:
         clean_env.setenv("HERMES_DESKTOP", "1")
         _srv = _reload_resolver()
         assert _srv._session_source({"source": "telegram"}) == "telegram"
-
 

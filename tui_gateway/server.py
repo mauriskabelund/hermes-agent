@@ -3291,7 +3291,15 @@ def _resolve_session_source(explicit: str | None) -> str:
 
 
 def _resolve_agent_platform(source: str | None) -> str:
-    return _resolve_session_source(source)
+    """Resolve a stored/client source label to the agent-facing platform.
+
+    Older desktop and web-chat clients persist ``source="webui"``. Keep that
+    durable source label intact for routing and history, but give the agent the
+    canonical graphical-chat platform so platform-scoped tools, skills, and
+    guidance match current ``source="desktop"`` clients.
+    """
+    resolved = _resolve_session_source(source)
+    return "desktop" if resolved.strip().lower() == "webui" else resolved
 
 
 def _config_model_target() -> tuple[str, str]:

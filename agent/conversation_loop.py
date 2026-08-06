@@ -6741,16 +6741,19 @@ def run_conversation(
                     messages.pop()
 
                 try:
+                    from agent.verify_hooks import max_verify_nudges
                     from agent.verification_stop import (
                         build_verify_on_stop_nudge,
                         verify_on_stop_enabled,
                     )
 
+                    _verify_nudge_limit = max_verify_nudges()
                     if verify_on_stop_enabled():
                         _verify_nudge = build_verify_on_stop_nudge(
                             session_id=getattr(agent, "session_id", None),
                             changed_paths=getattr(agent, "_turn_file_mutation_paths", set()),
                             attempts=getattr(agent, "_verification_stop_nudges", 0),
+                            max_attempts=_verify_nudge_limit,
                         )
                     else:
                         _verify_nudge = None
@@ -6812,7 +6815,14 @@ def run_conversation(
                     from hermes_cli.lifecycle import has_hook
                     from hermes_cli.plugins import get_pre_verify_continue_message
 
-                    if _edited and has_hook("pre_verify") and _attempt < max_verify_nudges():
+                    _total_verify_nudges = (
+                        getattr(agent, "_verification_stop_nudges", 0) + _attempt
+                    )
+                    if (
+                        _edited
+                        and _total_verify_nudges < max_verify_nudges()
+                        and has_hook("pre_verify")
+                    ):
                         # Posture is fixed for the session — resolve once + cache.
                         coding = getattr(agent, "_resolved_is_coding", None)
                         if coding is None:
