@@ -119,6 +119,53 @@ def test_verify_on_stop_and_pre_verify_share_one_budget(agent, monkeypatch):
     pre_verify.assert_not_called()
 
 
+def test_pre_verify_and_verify_on_stop_share_one_budget_in_reverse_order(
+    agent, monkeypatch
+):
+    agent.max_iterations = 2
+    agent.iteration_budget.max_total = 2
+    answers = iter([_response("premature report"), _response("verified report")])
+    observed_attempts = []
+
+    def model_call(_api_kwargs):
+        agent._turn_file_mutation_paths = {"changed.py"}
+        return next(answers)
+
+    def build_nudge(**kwargs):
+        observed_attempts.append(kwargs["attempts"])
+        if len(observed_attempts) == 1:
+            return None
+        if kwargs["attempts"] < kwargs["max_attempts"]:
+            return "verify it"
+        return None
+
+    agent._interruptible_api_call = model_call
+    agent._handle_max_iterations = MagicMock(return_value="replacement summary")
+    monkeypatch.setenv("HERMES_VERIFY_ON_STOP", "1")
+
+    with (
+        patch(
+            "agent.verification_stop.build_verify_on_stop_nudge",
+            side_effect=build_nudge,
+        ),
+        patch("agent.verify_hooks.max_verify_nudges", return_value=1),
+        patch("hermes_cli.plugins.has_hook", return_value=True),
+        patch(
+            "hermes_cli.plugins.get_pre_verify_continue_message",
+            return_value="run project tests",
+        ) as pre_verify,
+        patch("hermes_cli.plugins.invoke_hook", return_value=[]),
+    ):
+        result = agent.run_conversation("edit changed.py")
+
+    assert result["final_response"] == "verified report"
+    assert result["completed"] is True
+    assert observed_attempts == [0, 1]
+    pre_verify.assert_called_once()
+    assert agent._pre_verify_nudges == 1
+    assert getattr(agent, "_verification_stop_nudges", 0) == 0
+
+
 def test_pre_verify_preserves_composed_report_at_budget_limit(agent, monkeypatch):
     def model_call(_api_kwargs):
         agent._turn_file_mutation_paths = {"changed.py"}

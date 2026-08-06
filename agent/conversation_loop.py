@@ -6749,10 +6749,14 @@ def run_conversation(
 
                     _verify_nudge_limit = max_verify_nudges()
                     if verify_on_stop_enabled():
+                        _verify_nudge_attempts = (
+                            getattr(agent, "_verification_stop_nudges", 0)
+                            + getattr(agent, "_pre_verify_nudges", 0)
+                        )
                         _verify_nudge = build_verify_on_stop_nudge(
                             session_id=getattr(agent, "session_id", None),
                             changed_paths=getattr(agent, "_turn_file_mutation_paths", set()),
-                            attempts=getattr(agent, "_verification_stop_nudges", 0),
+                            attempts=_verify_nudge_attempts,
                             max_attempts=_verify_nudge_limit,
                         )
                     else:
