@@ -345,6 +345,27 @@ class TestBuildSkillsSystemPrompt:
         assert "web-search" in result
         assert "old-tool" not in result
 
+    def test_explicit_platform_filters_platform_disabled_skills(
+        self, monkeypatch, tmp_path
+    ):
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+        monkeypatch.setenv("HERMES_PLATFORM", "telegram")
+        skills_dir = tmp_path / "skills" / "tools"
+        skill_dir = skills_dir / "cli-only-disabled"
+        skill_dir.mkdir(parents=True)
+        (skill_dir / "SKILL.md").write_text(
+            "---\nname: cli-only-disabled\ndescription: CLI-disabled skill\n---\n"
+        )
+        (tmp_path / "config.yaml").write_text(
+            "skills:\n"
+            "  platform_disabled:\n"
+            "    cli: [cli-only-disabled]\n"
+        )
+
+        result = build_skills_system_prompt(platform="cli")
+
+        assert "cli-only-disabled" not in result
+
     def test_rebuilds_prompt_when_disabled_skills_change(self, monkeypatch, tmp_path):
         monkeypatch.setenv("HERMES_HOME", str(tmp_path))
         skill_dir = tmp_path / "skills" / "tools" / "cached-skill"
