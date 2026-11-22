@@ -141,6 +141,38 @@ def _openai_speech_create_with_format_fallback(client, create_kwargs: dict[str, 
         return client.audio.speech.create(**retry_kwargs)
 
 
+# Base URLs whose speech endpoint rejected mp3/opus (wav/pcm-only local servers like Ollama phonon).
+_WAV_ONLY_BASE_URLS: set = set()
+
+
+def _speech_via_wav_transcode(client, create_kwargs: dict[str, Any], output_path: str) -> None:
+    """Fetch wav from a wav/pcm-only backend and ffmpeg-transcode it to ``output_path``'s format."""
+    import os
+    import shutil
+    import subprocess
+    import tempfile
+
+    ffmpeg = shutil.which("ffmpeg")
+    if not ffmpeg:
+        raise RuntimeError("TTS backend only serves wav/pcm and ffmpeg is not installed to transcode it")
+    logger.warning("TTS backend rejected response_format=%r — retrying as 'wav' and transcoding.",
+                   create_kwargs.get("response_format"))
+    retry_kwargs = dict(create_kwargs, response_format="wav")
+    retry_kwargs["extra_headers"] = {"x-idempotency-key": str(uuid.uuid4())}
+    fd, wav_path = tempfile.mkstemp(suffix=".wav")
+    os.close(fd)
+    try:
+        client.audio.speech.create(**retry_kwargs).stream_to_file(wav_path)
+        codec = ["-c:a", "libopus", "-b:a", "48k"] if output_path.endswith(".ogg") else ["-c:a", "libmp3lame", "-q:a", "4"]
+        subprocess.run([ffmpeg, "-y", "-loglevel", "error", "-i", wav_path, *codec, output_path],
+                       check=True, capture_output=True, timeout=60)
+    finally:
+        try:
+            os.unlink(wav_path)
+        except OSError:
+            pass
+
+
 def _generate_openai_tts(
     text: str, output_path: str, tts_config: dict[str, Any], *, api_key: Optional[str] = None,
     base_url: Optional[str] = None, model: Optional[str] = None, voice: Optional[str] = None,
@@ -188,7 +220,18 @@ def _generate_openai_tts(
         create_kwargs["extra_body"] = extra_body
     client = _origin()._import_openai_client()(api_key=api_key, base_url=base_url)
     try:
-        _openai_speech_create_with_format_fallback(client, create_kwargs).stream_to_file(output_path)
+        if base_url in _WAV_ONLY_BASE_URLS and create_kwargs.get("response_format") in ("mp3", "opus"):
+            _speech_via_wav_transcode(client, create_kwargs, output_path)
+            return output_path
+        try:
+            _openai_speech_create_with_format_fallback(client, create_kwargs).stream_to_file(output_path)
+        except Exception as exc:
+            # Some local OpenAI-compatible servers (e.g. Ollama "phonon") serve only wav/pcm and
+            # reject mp3/opus. Retry once as wav and transcode into the requested container.
+            if create_kwargs.get("response_format") not in ("mp3", "opus") or not _is_response_format_rejection(exc):
+                raise
+            _WAV_ONLY_BASE_URLS.add(base_url)  # skip the doomed mp3/opus request next time
+            _speech_via_wav_transcode(client, create_kwargs, output_path)
         return output_path
     finally:
         close = getattr(client, "close", None)
